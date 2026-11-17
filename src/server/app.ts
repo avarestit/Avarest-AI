@@ -40,6 +40,7 @@ function resolveAllowedOrigin(origin: string | undefined, appUrl: string): strin
     if (origin === appUrl) return origin;
     if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return origin;
     if (parsed.hostname === 'avarestai.com' || parsed.hostname.endsWith('.avarestai.com')) return origin;
+    if (parsed.hostname === 'avarest-ai-staging.avarestglobal.workers.dev') return origin;
     if (parsed.hostname.endsWith('.run.app')) return origin;
     return null;
   } catch {
@@ -172,7 +173,10 @@ export function createAvarestApiApp(options?: {
         ? 'unconfigured_blocked'
         : 'local_sandbox';
 
-    const healthy = validation.valid && (config.supabaseConfigured ? dbPing.reachable : config.environment !== 'production');
+    const healthy =
+      validation.valid &&
+      (config.supabaseConfigured ? dbPing.reachable : config.environment !== 'production') &&
+      (config.environment === 'production' ? config.configValidation.authSessionSecretStrong : true);
 
     return c.json({
       status: healthy ? 'ok' : 'degraded',

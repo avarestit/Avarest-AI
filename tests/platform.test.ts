@@ -863,3 +863,176 @@ describe('Phase 02 Security, Edge Headers, Validation & Concurrency Regression S
     expect(sql).toContain('credit_accounts_owner_select ON public.credit_accounts FOR SELECT TO authenticated');
   });
 });
+
+describe('Cloudflare Workers Global Scope & Production Secret Guardrails', () => {
+  it('does not call crypto.randomUUID() at global scope when importing env.ts or worker.ts', async () => {
+    vi.resetModules();
+    const randomUuidSpy = vi.spyOn(crypto, 'randomUUID');
+
+    const envMod = await import('../src/server/env.ts');
+    const workerMod = await import('../src/worker.ts');
+
+    expect(workerMod.default).toBeDefined();
+    expect(typeof workerMod.default.fetch).toBe('function');
+    expect(randomUuidSpy).not.toHaveBeenCalled();
+
+    // Calling getServerConfig in staging with an explicit secret also avoids ephemeral UUID generation
+    const explicitConfig = envMod.getServerConfig({
+      AVAREST_ENVIRONMENT: 'staging',
+      AUTH_SESSION_SECRET: 'explicit-staging-secret-1234567890',
+    });
+    expect(explicitConfig.authSessionSecret).toBe('explicit-staging-secret-1234567890');
+    expect(randomUuidSpy).not.toHaveBeenCalled();
+  });
+
+  it('generates staging fallback secret lazily and keeps it stable within the same isolate', async () => {
+    vi.resetModules();
+    const randomUuidSpy = vi.spyOn(crypto, 'randomUUID');
+
+    const { getServerConfig: isolatedGetConfig } = await import('../src/server/env.ts');
+    expect(randomUuidSpy).not.toHaveBeenCalled();
+
+    const first = isolatedGetConfig({ AVAREST_ENVIRONMENT: 'staging' });
+    expect(randomUuidSpy).toHaveBeenCalledTimes(1);
+    expect(first.authSessionSecret.startsWith('avarest-local-')).toBe(true);
+    expect(first.authSessionSecret.length).toBeGreaterThanOrEqual(16);
+
+    const second = isolatedGetConfig({ AVAREST_ENVIRONMENT: 'staging' });
+    expect(randomUuidSpy).toHaveBeenCalledTimes(1);
+    expect(second.authSessionSecret).toBe(first.authSessionSecret);
+  });
+
+  it('fails closed in production when AUTH_SESSION_SECRET is missing, weak, or placeholder', async () => {
+    vi.resetModules();
+    const randomUuidSpy = vi.spyOn(crypto, 'randomUUID');
+    const { getServerConfig: isolatedGetConfig } = await import('../src/server/env.ts');
+    const { signSessionToken, verifySessionToken } = await import('../src/server/lib/crypto.ts');
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+
+    for (const badSecret of [undefined, '', 'short-secret', 'YOUR_AUTH_SESSION_SECRET']) {
+      const prodCfg = isolatedGetConfig({
+        AVAREST_ENVIRONMENT: 'production',
+        VITE_ENVIRONMENT: 'production',
+        SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        VITE_SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        SUPABASE_SERVICE_ROLE_KEY: 'prod-service-role-test',
+        VITE_SUPABASE_ANON_KEY: 'prod-anon-test',
+        ...(badSecret !== undefined ? { AUTH_SESSION_SECRET: badSecret } : {}),
+      });
+
+      expect(prodCfg.authSessionSecret).toBe('');
+      expect(prodCfg.configValidation.authSessionSecretStrong).toBe(false);
+      expect(prodCfg.configValidation.missingRequired).toContain('AUTH_SESSION_SECRET (>= 16 chars)');
+      expect(randomUuidSpy).not.toHaveBeenCalled();
+    }
+
+    await expect(
+      signSessionToken({ sub: 'u1', email: 'u1@avarestai.com', role: 'user', exp: Date.now() + 60_000 }, ''),
+    ).rejects.toThrow();
+    expect(await verifySessionToken('a.b.c', '')).toBeNull();
+
+    // Production app with missing AUTH_SESSION_SECRET reports degraded health & blocks protected endpoints (503)
+    const prodApp = createAvarestApiApp({
+      repoOverride: new MemoryWorkspaceRepository(createStore()),
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'production',
+        VITE_ENVIRONMENT: 'production',
+        SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        VITE_SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        SUPABASE_SERVICE_ROLE_KEY: 'prod-service-role-test',
+        VITE_SUPABASE_ANON_KEY: 'prod-anon-test',
+      },
+    });
+
+    const health = await prodApp.request('/api/v1/health');
+    expect(health.status).toBe(200);
+    const healthJson = (await health.json()) as { status: string; configValidation: { authSessionSecretStrong: boolean } };
+    expect(healthJson.status).toBe('degraded');
+    expect(healthJson.configValidation.authSessionSecretStrong).toBe(false);
+
+    const protectedRes = await prodApp.request('/api/v1/projects', {
+      headers: { Authorization: 'Bearer any-token' },
+    });
+    expect(protectedRes.status).toBe(503);
+    const protectedJson = (await protectedRes.json()) as { error: { code: string } };
+    expect(protectedJson.error.code).toBe('AUTH_NOT_CONFIGURED');
+  });
+
+  it('works in production when a valid strong AUTH_SESSION_SECRET and production Supabase config are provided', async () => {
+    const prodSecret = 'prod-strong-session-secret-0123456789abcdef';
+    const prodCfg = getServerConfig({
+      AVAREST_ENVIRONMENT: 'production',
+      VITE_ENVIRONMENT: 'production',
+      SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+      VITE_SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+      SUPABASE_SERVICE_ROLE_KEY: 'prod-service-role-test',
+      VITE_SUPABASE_ANON_KEY: 'prod-anon-test',
+      AUTH_SESSION_SECRET: prodSecret,
+    });
+
+    expect(prodCfg.environment).toBe('production');
+    expect(prodCfg.supabaseConfigured).toBe(true);
+    expect(prodCfg.isolationErrors).toHaveLength(0);
+    expect(prodCfg.configValidation.authSessionSecretStrong).toBe(true);
+    expect(prodCfg.configValidation.missingRequired).toHaveLength(0);
+    expect(prodCfg.authSessionSecret).toBe(prodSecret);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.includes('/rest/v1/')) {
+          return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(
+          JSON.stringify({ id: 'supa-u1', email: 'produser@avarestai.com', user_metadata: { full_name: 'Prod User' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }),
+    );
+
+    const prodApp = createAvarestApiApp({
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'production',
+        VITE_ENVIRONMENT: 'production',
+        SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        VITE_SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+        SUPABASE_SERVICE_ROLE_KEY: 'prod-service-role-test',
+        VITE_SUPABASE_ANON_KEY: 'prod-anon-test',
+        AUTH_SESSION_SECRET: prodSecret,
+      },
+    });
+
+    const health = await prodApp.request('/api/v1/health');
+    expect(health.status).toBe(200);
+    const healthJson = (await health.json()) as { status: string; environment: string };
+    expect(healthJson.status).toBe('ok');
+    expect(healthJson.environment).toBe('production');
+  });
+
+  it('allows avarest-ai-staging.avarestglobal.workers.dev in CORS while rejecting arbitrary workers.dev origins', async () => {
+    const app = createAvarestApiApp({
+      store: createStore(),
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+      },
+    });
+
+    const stagingWorkersPreflight = await app.request('/api/v1/health', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://avarest-ai-staging.avarestglobal.workers.dev' },
+    });
+    expect(stagingWorkersPreflight.status).toBe(204);
+    expect(stagingWorkersPreflight.headers.get('Access-Control-Allow-Origin')).toBe(
+      'https://avarest-ai-staging.avarestglobal.workers.dev',
+    );
+
+    const untrustedWorkersPreflight = await app.request('/api/v1/health', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://malicious-clone.workers.dev' },
+    });
+    expect(untrustedWorkersPreflight.status).toBe(403);
+    expect(untrustedWorkersPreflight.headers.get('Access-Control-Allow-Origin')).toBeNull();
+  });
+});
+

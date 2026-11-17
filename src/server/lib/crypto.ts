@@ -54,6 +54,9 @@ export interface SessionPayload {
 }
 
 export async function signSessionToken(payload: SessionPayload, secret: string): Promise<string> {
+  if (!secret || secret.length < 16) {
+    throw new Error('AUTH_SESSION_SECRET is missing or too weak to sign session tokens.');
+  }
   const header = toBase64Url(encoder.encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const body = toBase64Url(encoder.encode(JSON.stringify(payload)));
   const unsigned = `${header}.${body}`;
@@ -64,6 +67,7 @@ export async function signSessionToken(payload: SessionPayload, secret: string):
 
 export async function verifySessionToken(token: string, secret: string): Promise<SessionPayload | null> {
   try {
+    if (!secret || secret.length < 16) return null;
     const parts = token.split('.');
     if (parts.length !== 3) return null;
     const [header, body, sig] = parts;

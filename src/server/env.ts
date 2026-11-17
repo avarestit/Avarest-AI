@@ -96,8 +96,17 @@ function readRawPlaceholderWarning(bindings: ServerBindings | undefined, key: ke
   return typeof raw === 'string' && raw.trim().length > 0 && isPlaceholderValue(raw);
 }
 
-// Ephemeral fallback secret per process only for local/staging when AUTH_SESSION_SECRET is unset
-const EPHEMERAL_LOCAL_SECRET = `avarest-local-${crypto.randomUUID()}`;
+// Lazy isolate-scoped fallback secret only for local/staging when AUTH_SESSION_SECRET is unset.
+// Never evaluated at module import time (Cloudflare Workers disallows crypto.randomUUID in global scope)
+// and never used in production.
+let cachedEphemeralLocalSecret: string | null = null;
+
+function getOrCreateEphemeralLocalSecret(): string {
+  if (!cachedEphemeralLocalSecret) {
+    cachedEphemeralLocalSecret = `avarest-local-${crypto.randomUUID()}`;
+  }
+  return cachedEphemeralLocalSecret;
+}
 
 export function getServerConfig(bindings?: ServerBindings): ResolvedServerConfig {
   const envName = normalizeEnvironment(readVar(bindings, 'AVAREST_ENVIRONMENT'));
@@ -204,7 +213,12 @@ export function getServerConfig(bindings?: ServerBindings): ResolvedServerConfig
     supabaseAnonKey,
     supabaseConfigured: Boolean(serverSupabaseUrl && supabaseServiceRoleKey && isolationErrors.length === 0),
     isolationErrors,
-    authSessionSecret: configuredSessionSecret || EPHEMERAL_LOCAL_SECRET,
+    authSessionSecret:
+      envName === 'production'
+        ? authSessionSecretStrong && configuredSessionSecret
+          ? configuredSessionSecret
+          : ''
+        : configuredSessionSecret || getOrCreateEphemeralLocalSecret(),
     adminBootstrapSecret: configuredBootstrapSecret,
     hasRateLimitKv: Boolean(bindings?.RATE_LIMIT_KV),
     configValidation: {

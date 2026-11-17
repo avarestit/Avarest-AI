@@ -21,6 +21,19 @@ export async function authenticateRequest(
   const config = c.get('serverConfig');
   const repo = c.get('repo');
 
+  if (config.environment === 'production' && !config.configValidation.authSessionSecretStrong) {
+    return c.json(
+      {
+        error: {
+          code: 'AUTH_NOT_CONFIGURED',
+          message: 'Production runtime requires a strong configured AUTH_SESSION_SECRET (>= 16 chars).',
+          requestId: c.get('requestId'),
+        },
+      },
+      503,
+    );
+  }
+
   if (!repo) {
     return c.json(
       {
