@@ -22,13 +22,17 @@ APP_URL = "https://staging.avarestai.com"
 name = "avarest-ai-staging"
 [env.staging.vars]
 AVAREST_ENVIRONMENT = "staging"
+VITE_ENVIRONMENT = "staging"
 SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
+VITE_SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
 APP_URL = "https://avarest-ai-staging.avarestglobal.workers.dev"
 
-# Optional Staging KV binding (uncomment after creating KV namespace in Cloudflare):
+# Existing Staging KV binding: bind namespace `avarest-ai-staging-rate-limit` as `RATE_LIMIT_KV`.
+# Retrieve the real namespace ID from Cloudflare (`npx wrangler kv namespace list` or Dashboard -> KV)
+# and uncomment below (never invent an ID):
 # [[env.staging.kv_namespaces]]
 # binding = "RATE_LIMIT_KV"
-# id = "YOUR_STAGING_KV_NAMESPACE_ID"
+# id = "<ACTUAL_ID_FOR_avarest-ai-staging-rate-limit>"
 
 [env.production]
 name = "avarest-one-api-production"

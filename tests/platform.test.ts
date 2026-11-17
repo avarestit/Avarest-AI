@@ -1034,5 +1034,33 @@ describe('Cloudflare Workers Global Scope & Production Secret Guardrails', () =>
     expect(untrustedWorkersPreflight.status).toBe(403);
     expect(untrustedWorkersPreflight.headers.get('Access-Control-Allow-Origin')).toBeNull();
   });
+
+  it('verifies wrangler.toml [env.staging] vars and absence of misnamed or leaked VITE_ variables', () => {
+    const wranglerToml = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.toml'), 'utf-8');
+    expect(wranglerToml).toContain('[env.staging]');
+    expect(wranglerToml).toContain('name = "avarest-ai-staging"');
+    expect(wranglerToml).toContain('AVAREST_ENVIRONMENT = "staging"');
+    expect(wranglerToml).toContain('VITE_ENVIRONMENT = "staging"');
+    expect(wranglerToml).toContain('SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"');
+    expect(wranglerToml).toContain('VITE_SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"');
+    expect(wranglerToml).toContain('APP_URL = "https://avarest-ai-staging.avarestglobal.workers.dev"');
+    expect(wranglerToml).toContain('avarest-ai-staging-rate-limit');
+    // Production block remains untouched
+    expect(wranglerToml).toContain('[env.production]');
+    expect(wranglerToml).toContain('SUPABASE_URL = "https://zdvhksmtxelxcudssdus.supabase.co"');
+    expect(wranglerToml).toContain('APP_URL = "https://avarestai.com"');
+
+    // Verify no misnamed VITE_SUPABASE_STAGING_ANON_KEY or VITE_-prefixed server secrets exist
+    expect(wranglerToml).not.toContain('VITE_SUPABASE_STAGING_ANON_KEY');
+    expect(wranglerToml).not.toContain('VITE_SUPABASE_SERVICE_ROLE_KEY');
+    expect(wranglerToml).not.toContain('VITE_GEMINI_API_KEY');
+
+    const envTs = fs.readFileSync(path.resolve(process.cwd(), 'src/server/env.ts'), 'utf-8');
+    expect(envTs).toContain('VITE_SUPABASE_URL');
+    expect(envTs).toContain('VITE_SUPABASE_ANON_KEY');
+    expect(envTs).toContain('GEMINI_API_KEY');
+    expect(envTs).not.toContain('VITE_SUPABASE_STAGING_ANON_KEY');
+  });
 });
+
 
