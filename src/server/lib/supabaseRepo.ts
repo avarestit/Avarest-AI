@@ -358,6 +358,7 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
         routingReason: m.routing_reason ? String(m.routing_reason) : null,
         inputTokens: Number(m.input_tokens || 0),
         outputTokens: Number(m.output_tokens || 0),
+        usageIsEstimated: Boolean(m.usage_is_estimated),
         citations: Array.isArray(m.citations) ? m.citations : [],
         createdAt: String(m.created_at),
       })),
@@ -427,6 +428,7 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
       routing_reason: message.routingReason || null,
       input_tokens: message.inputTokens,
       output_tokens: message.outputTokens,
+      usage_is_estimated: Boolean(message.usageIsEstimated),
       citations: message.citations,
       created_at: message.createdAt,
     });

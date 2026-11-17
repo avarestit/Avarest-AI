@@ -408,6 +408,36 @@ CREATE POLICY feature_flags_admin_insert ON public.feature_flags FOR INSERT TO a
 CREATE POLICY feature_flags_admin_update ON public.feature_flags FOR UPDATE TO authenticated USING (public.is_admin()) WITH CHECK (public.is_admin());
 CREATE POLICY feature_flags_admin_delete ON public.feature_flags FOR DELETE TO authenticated USING (public.is_admin());
 
+-- USAGE, CREDITS, BILLING, LOGS & FLAGS (Scope SELECT explicitly TO authenticated & add usage_is_estimated)
+ALTER TABLE public.messages
+  ADD COLUMN IF NOT EXISTS usage_is_estimated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE public.usage_records
+  ADD COLUMN IF NOT EXISTS usage_is_estimated BOOLEAN NOT NULL DEFAULT FALSE;
+
+DROP POLICY IF EXISTS routing_logs_owner_select ON public.routing_logs;
+CREATE POLICY routing_logs_owner_select ON public.routing_logs FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS credit_accounts_owner_select ON public.credit_accounts;
+CREATE POLICY credit_accounts_owner_select ON public.credit_accounts FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS credit_ledger_owner_select ON public.credit_ledger;
+CREATE POLICY credit_ledger_owner_select ON public.credit_ledger FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS usage_records_owner_select ON public.usage_records;
+CREATE POLICY usage_records_owner_select ON public.usage_records FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS subscriptions_owner_select ON public.subscriptions;
+CREATE POLICY subscriptions_owner_select ON public.subscriptions FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS payment_tx_owner_select ON public.payment_transactions;
+CREATE POLICY payment_tx_owner_select ON public.payment_transactions FOR SELECT TO authenticated USING (auth.uid() = user_id OR public.is_admin());
+
+DROP POLICY IF EXISTS audit_logs_admin ON public.audit_logs;
+CREATE POLICY audit_logs_admin ON public.audit_logs FOR SELECT TO authenticated USING (public.is_admin());
+
+DROP POLICY IF EXISTS feature_flags_read ON public.feature_flags;
+CREATE POLICY feature_flags_read ON public.feature_flags FOR SELECT TO authenticated USING (TRUE);
+
 -- ----------------------------------------------------------------------------
 -- 5. SEED INITIAL 4 ACTIVE PROVIDERS & DEFAULT ROUTING / FLAGS (IDEMPOTENT)
 -- ----------------------------------------------------------------------------

@@ -65,7 +65,7 @@ export function TopBar({
           type="button"
           onClick={onOpenMobileNav}
           aria-label="Open navigation"
-          className="lg:hidden p-2 -ml-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+          className="lg:hidden p-2 -ml-2 rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
         >
           <Menu className="w-5 h-5" />
         </button>
@@ -117,7 +117,7 @@ export function TopBar({
           type="button"
           onClick={() => onChangeLanguage(language === 'en' ? 'bn' : 'en')}
           title="Switch language (English / বাংলা)"
-          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-800 whitespace-nowrap shrink-0"
+          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 border border-slate-200 dark:border-slate-800 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
         >
           <Globe className="w-3.5 h-3.5" />
           <span>{language === 'en' ? 'EN' : 'বাংলা'}</span>
@@ -146,7 +146,7 @@ export function TopBar({
                 title={opt.label}
                 aria-label={opt.label}
                 aria-pressed={active}
-                className={`p-1.5 rounded-md transition-colors ${
+                className={`p-1.5 rounded-md transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
                   active
                     ? 'bg-white dark:bg-slate-900 text-indigo-600 dark:text-indigo-400 shadow-xs'
                     : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'

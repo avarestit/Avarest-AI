@@ -232,5 +232,12 @@ export interface SystemHealthStatus {
     displayName: string;
     configured: boolean;
   }>;
+  configValidation?: {
+    missingRequired: string[];
+    missingOptional: string[];
+    warnings: string[];
+    authSessionSecretStrong: boolean;
+    adminBootstrapSecretStrong: boolean;
+  };
   timestamp: string;
 }

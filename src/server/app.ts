@@ -33,6 +33,20 @@ const ALLOWED_DOC_MIMES = new Set([
   'application/json',
 ]);
 
+function resolveAllowedOrigin(origin: string | undefined, appUrl: string): string | null {
+  if (!origin) return null;
+  try {
+    const parsed = new URL(origin);
+    if (origin === appUrl) return origin;
+    if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') return origin;
+    if (parsed.hostname === 'avarestai.com' || parsed.hostname.endsWith('.avarestai.com')) return origin;
+    if (parsed.hostname.endsWith('.run.app')) return origin;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function createAvarestApiApp(options?: {
   store?: WorkspaceStore;
   repoOverride?: WorkspaceRepository;
@@ -42,11 +56,20 @@ export function createAvarestApiApp(options?: {
   const memoryRepo = new MemoryWorkspaceRepository(localStore);
   const app = new Hono<{ Bindings: ServerBindings; Variables: AuthContextVariables }>();
 
-  // Global request ID, config resolution, isolation enforcement, and repository resolution
+  // Global request ID, security headers, strict CORS allowlist, config resolution, and isolation enforcement
   app.use('*', async (c, next) => {
     const requestId = crypto.randomUUID();
     c.set('requestId', requestId);
     c.header('X-Request-Id', requestId);
+    c.header('X-Content-Type-Options', 'nosniff');
+    c.header('X-Frame-Options', 'DENY');
+    c.header('Referrer-Policy', 'strict-origin-when-cross-origin');
+    c.header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+
+    const path = c.req.path;
+    if (path.startsWith('/api/v1/auth/') || path.startsWith('/api/v1/admin/')) {
+      c.header('Cache-Control', 'no-store');
+    }
 
     const mergedBindings: ServerBindings = {
       ...(c.env || {}),
@@ -55,6 +78,18 @@ export function createAvarestApiApp(options?: {
     const serverConfig = getServerConfig(mergedBindings);
     c.set('serverConfig', serverConfig);
     c.set('rateLimiter', resolveRateLimitAdapter(mergedBindings));
+
+    const reqOrigin = c.req.header('Origin');
+    const allowedOrigin = resolveAllowedOrigin(reqOrigin, serverConfig.appUrl);
+    if (allowedOrigin) {
+      c.header('Access-Control-Allow-Origin', allowedOrigin);
+      c.header('Vary', 'Origin');
+      c.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Bootstrap-Secret');
+    }
+    if (c.req.method === 'OPTIONS') {
+      return c.body(null, allowedOrigin ? 204 : 403);
+    }
 
     if (serverConfig.isolationErrors.length > 0) {
       return c.json(
@@ -96,6 +131,9 @@ export function createAvarestApiApp(options?: {
         { error: { code: 'PROVIDER_ERROR', provider: err.providerId, message: err.message, requestId } },
         (err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 502) as 400 | 403 | 429 | 502 | 503,
       );
+    }
+    if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
     }
     console.error(`[Avarest API Error] ${requestId}:`, err instanceof Error ? err.message : 'Unknown error');
     return c.json(
@@ -152,6 +190,7 @@ export function createAvarestApiApp(options?: {
         errors: validation.errors,
       },
       providers: getProviderSummary(config),
+      configValidation: config.configValidation,
       timestamp: new Date().toISOString(),
     });
   });
@@ -313,18 +352,38 @@ export function createAvarestApiApp(options?: {
     }
     if (!config.adminBootstrapSecret || config.adminBootstrapSecret.length < 16) {
       return c.json(
-        { error: { code: 'BOOTSTRAP_DISABLED', message: 'ADMIN_BOOTSTRAP_SECRET is not configured on the server.', requestId: c.get('requestId') } },
-        403,
+        {
+          error: {
+            code: 'BOOTSTRAP_NOT_CONFIGURED',
+            message: 'ADMIN_BOOTSTRAP_SECRET (>= 16 chars) is not configured on the server.',
+            requestId: c.get('requestId'),
+          },
+        },
+        503,
       );
     }
 
     const providedSecret = c.req.header('x-admin-bootstrap-secret') || '';
-    if (!timingSafeEqualStrings(providedSecret, config.adminBootstrapSecret)) {
+    if (!providedSecret || !timingSafeEqualStrings(providedSecret, config.adminBootstrapSecret)) {
+      await repo.appendAuditLog({
+        actorId: 'system',
+        action: 'admin.bootstrap.rejected',
+        resourceType: 'admin_bootstrap',
+        resourceId: null,
+        detail: 'Rejected admin bootstrap attempt due to missing or invalid secret.',
+      });
       return c.json({ error: { code: 'FORBIDDEN', message: 'Invalid bootstrap secret.', requestId: c.get('requestId') } }, 403);
     }
 
     const existingAdmins = await repo.countAdmins();
     if (existingAdmins > 0) {
+      await repo.appendAuditLog({
+        actorId: 'system',
+        action: 'admin.bootstrap.locked_attempt',
+        resourceType: 'admin_bootstrap',
+        resourceId: null,
+        detail: 'Blocked bootstrap replay attempt because a platform administrator already exists.',
+      });
       return c.json(
         { error: { code: 'ADMIN_ALREADY_EXISTS', message: 'Bootstrap locked: a platform administrator already exists.', requestId: c.get('requestId') } },
         409,
@@ -494,12 +553,23 @@ export function createAvarestApiApp(options?: {
     return c.json({ project }, 201);
   });
 
+  const projectPatchSchema = z.object({
+    name: z.string().min(1).max(120).optional(),
+    description: z.string().max(500).optional(),
+    instructions: z.string().max(2000).optional(),
+    archived: z.boolean().optional(),
+  });
+
   app.patch('/api/v1/projects/:id', async (c) => {
     const user = c.get('currentUser');
     const repo = c.get('repo')!;
     const id = c.req.param('id') || '';
-    const body = await c.req.json().catch(() => ({}));
-    const updated = await repo.updateProject(user.id, id, body);
+    const body = await c.req.json().catch(() => null);
+    const parsed = projectPatchSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid project update payload.' } }, 400);
+    }
+    const updated = await repo.updateProject(user.id, id, parsed.data);
     if (!updated) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Project not found.' } }, 404);
     }
@@ -559,12 +629,23 @@ export function createAvarestApiApp(options?: {
     return c.json({ conversation });
   });
 
+  const conversationPatchSchema = z.object({
+    title: z.string().min(1).max(120).optional(),
+    archived: z.boolean().optional(),
+    routingMode: z.enum(['auto', 'manual']).optional(),
+    preferredModel: z.string().max(120).nullable().optional(),
+  });
+
   app.patch('/api/v1/conversations/:id', async (c) => {
     const user = c.get('currentUser');
     const repo = c.get('repo')!;
     const id = c.req.param('id') || '';
-    const body = await c.req.json().catch(() => ({}));
-    const conversation = await repo.updateConversation(user.id, id, body);
+    const body = await c.req.json().catch(() => null);
+    const parsed = conversationPatchSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid conversation update payload.' } }, 400);
+    }
+    const conversation = await repo.updateConversation(user.id, id, parsed.data);
     if (!conversation) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Conversation not found.' } }, 404);
     }
@@ -712,8 +793,26 @@ export function createAvarestApiApp(options?: {
       const conversationId = conv.id;
       const bodyStream = new ReadableStream({
         async start(controller) {
+          let closed = false;
+          const safeEnqueue = (chunk: Uint8Array) => {
+            if (closed || c.req.raw.signal.aborted) return;
+            try {
+              controller.enqueue(chunk);
+            } catch {
+              closed = true;
+            }
+          };
+          const safeClose = () => {
+            if (closed) return;
+            closed = true;
+            try {
+              controller.close();
+            } catch {
+              // stream already closed or canceled by peer
+            }
+          };
           const sendEvent = (event: string, data: unknown) => {
-            controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+            safeEnqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
           };
 
           sendEvent('meta', {
@@ -731,6 +830,7 @@ export function createAvarestApiApp(options?: {
               config,
               signal: c.req.raw.signal,
             })) {
+              if (c.req.raw.signal.aborted) break;
               if (chunk.delta) {
                 sendEvent('delta', { delta: chunk.delta });
               }
@@ -789,7 +889,7 @@ export function createAvarestApiApp(options?: {
             });
 
             sendEvent('done', { message: assistantMsg, creditsCharged: creditCost });
-            controller.close();
+            safeClose();
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Streaming failed';
             await repo.addRoutingLog({
@@ -805,7 +905,7 @@ export function createAvarestApiApp(options?: {
               createdAt: new Date().toISOString(),
             });
             sendEvent('error', { message: msg });
-            controller.close();
+            safeClose();
           }
         },
       });
@@ -923,6 +1023,11 @@ export function createAvarestApiApp(options?: {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Research query must be at least 3 characters.' } }, 400);
     }
 
+    const currentBalance = await repo.getCreditBalance(user.id);
+    if (currentBalance < 0.25) {
+      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
+    }
+
     const policies = await repo.listRoutingPolicies();
     const decision = routeWithAvarestBrain({
       prompt: parsed.data.query,
@@ -994,6 +1099,11 @@ export function createAvarestApiApp(options?: {
     const parsed = coderSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid AI Coder request.' } }, 400);
+    }
+
+    const currentBalance = await repo.getCreditBalance(user.id);
+    if (currentBalance < 0.2) {
+      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
     }
 
     const policies = await repo.listRoutingPolicies();
@@ -1503,12 +1613,22 @@ export function createAvarestApiApp(options?: {
     return c.json({ flag });
   });
 
+  const policyPatchSchema = z.object({
+    active: z.boolean().optional(),
+    preferredModelId: z.string().min(1).max(120).optional(),
+    fallbackModelId: z.string().min(1).max(120).optional(),
+  });
+
   app.patch('/api/v1/admin/policies/:id', async (c) => {
     const actor = c.get('currentUser');
     const repo = c.get('repo')!;
     const id = c.req.param('id') || '';
-    const body = await c.req.json().catch(() => ({}));
-    const policy = await repo.updateRoutingPolicy(id, body);
+    const body = await c.req.json().catch(() => null);
+    const parsed = policyPatchSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid routing policy payload.' } }, 400);
+    }
+    const policy = await repo.updateRoutingPolicy(id, parsed.data);
     if (!policy) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Routing policy not found.' } }, 404);
     }

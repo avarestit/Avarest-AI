@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createAvarestApiApp } from '../src/server/app.ts';
 import { classifyPromptTask } from '../src/server/brain/classifier.ts';
 import {
+  executeProviderCompletion,
   parseSseLines,
   sanitizeProviderErrorMessage,
   streamProviderCompletion,
@@ -14,6 +15,7 @@ import { getServerConfig } from '../src/server/env.ts';
 import { createStore, deductCreditsAtomic } from '../src/server/lib/store.ts';
 import { KVRateLimitAdapter } from '../src/server/middleware/rateLimit.ts';
 import { SUPABASE_PROJECTS, validateEnvironmentIsolation } from '../src/shared/env.ts';
+import workerApp from '../src/worker.ts';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -641,5 +643,223 @@ describe('Security Migration SQL, Brand Assets, Theme & Mandatory Footer Checks'
     expect(appTsx).toContain('Design &amp; Developed by');
     expect(appTsx).toContain('https://avarestsoft.com/');
     expect(appTsx).toContain('Avarest Soft');
+  });
+});
+
+describe('Phase 02 Security, Edge Headers, Validation & Concurrency Regression Suite', () => {
+  it('ignores placeholder API keys and detects VITE_SUPABASE_URL vs SUPABASE_URL cross-mismatches', () => {
+    const placeholderCfg = getServerConfig({
+      AVAREST_ENVIRONMENT: 'staging',
+      GEMINI_API_KEY: 'MY_GEMINI_API_KEY',
+      OPENAI_API_KEY: 'YOUR_OPENAI_KEY',
+      ANTHROPIC_API_KEY: '<REPLACE_ME>',
+      ADMIN_BOOTSTRAP_SECRET: 'CHANGE_ME_BOOTSTRAP_SECRET',
+    });
+
+    expect(placeholderCfg.providers.gemini).toBeUndefined();
+    expect(placeholderCfg.providers.openai).toBeUndefined();
+    expect(placeholderCfg.providers.anthropic).toBeUndefined();
+    expect(placeholderCfg.adminBootstrapSecret).toBeUndefined();
+    expect(placeholderCfg.configValidation.warnings.length).toBeGreaterThanOrEqual(3);
+
+    const mismatchCfg = getServerConfig({
+      AVAREST_ENVIRONMENT: 'staging',
+      VITE_ENVIRONMENT: 'staging',
+      SUPABASE_URL: SUPABASE_PROJECTS.staging.url,
+      VITE_SUPABASE_URL: SUPABASE_PROJECTS.production.url,
+    });
+    expect(mismatchCfg.isolationErrors.length).toBeGreaterThan(0);
+    expect(mismatchCfg.supabaseConfigured).toBe(false);
+  });
+
+  it('sets security headers, enforces CORS allowlist, and fails closed on missing bootstrap secret (503) & brute-force (429)', async () => {
+    const appNoBootstrap = createAvarestApiApp({
+      store: createStore(),
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+        AUTH_SESSION_SECRET: 'test-secret-for-vitest-only-32-chars',
+      },
+    });
+
+    // CORS allowlist & security headers
+    const allowedPreflight = await appNoBootstrap.request('/api/v1/health', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://staging.avarestai.com' },
+    });
+    expect(allowedPreflight.status).toBe(204);
+    expect(allowedPreflight.headers.get('Access-Control-Allow-Origin')).toBe('https://staging.avarestai.com');
+    expect(allowedPreflight.headers.get('X-Content-Type-Options')).toBe('nosniff');
+    expect(allowedPreflight.headers.get('X-Frame-Options')).toBe('DENY');
+
+    const blockedPreflight = await appNoBootstrap.request('/api/v1/health', {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://evil-attacker.example' },
+    });
+    expect(blockedPreflight.status).toBe(403);
+    expect(blockedPreflight.headers.get('Access-Control-Allow-Origin')).toBeNull();
+
+    // Missing ADMIN_BOOTSTRAP_SECRET fails closed with 503
+    const missingSecretRes = await appNoBootstrap.request('/api/v1/admin/bootstrap', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'admin@avarestai.com', password: 'StrongPassword#2026' }),
+    });
+    expect(missingSecretRes.status).toBe(503);
+    expect(missingSecretRes.headers.get('Cache-Control')).toBe('no-store');
+
+    // Brute-force bootstrap attempts hit rate limit (429) after 5 tries
+    const appWithBootstrap = createAvarestApiApp({
+      store: createStore(),
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+        AUTH_SESSION_SECRET: 'test-secret-for-vitest-only-32-chars',
+        ADMIN_BOOTSTRAP_SECRET: 'valid-bootstrap-secret-1234567890',
+      },
+    });
+    for (let i = 0; i < 5; i++) {
+      const attempt = await appWithBootstrap.request('/api/v1/admin/bootstrap', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-bootstrap-secret': 'bad-guess',
+          'x-forwarded-for': '203.0.113.77',
+        },
+        body: JSON.stringify({ email: 'admin@avarestai.com', password: 'StrongPassword#2026' }),
+      });
+      expect(attempt.status).toBe(403);
+    }
+    const rateLimited = await appWithBootstrap.request('/api/v1/admin/bootstrap', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-bootstrap-secret': 'bad-guess',
+        'x-forwarded-for': '203.0.113.77',
+      },
+      body: JSON.stringify({ email: 'admin@avarestai.com', password: 'StrongPassword#2026' }),
+    });
+    expect(rateLimited.status).toBe(429);
+    expect(rateLimited.headers.get('Retry-After')).toBeTruthy();
+  });
+
+  it('enforces Zod PATCH validation and pre-flight 402 credit checks on research and coder', async () => {
+    const store = createStore();
+    const app = createAvarestApiApp({
+      store,
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+        AUTH_SESSION_SECRET: 'test-secret-for-vitest-only-32-chars',
+        GEMINI_API_KEY: 'test-gemini-key-active',
+      },
+    });
+
+    const reg = await app.request('/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'patchtest@avarestai.com', password: 'Password#1234', fullName: 'Patch Test' }),
+    });
+    const { token, user } = (await reg.json()) as { token: string; user: { id: string } };
+
+    // Create project & test invalid PATCH payload rejection
+    const projRes = await app.request('/api/v1/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ name: 'Valid Project' }),
+    });
+    const projId = ((await projRes.json()) as { project: { id: string } }).project.id;
+
+    const badPatch = await app.request(`/api/v1/projects/${projId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ archived: 'not-a-boolean' }),
+    });
+    expect(badPatch.status).toBe(400);
+
+    // Exhaust credits below threshold & verify 402 pre-flight on /research and /coder
+    store.credits.set(user.id, { balance: 0.05, monthlyAllowance: 100 });
+    const researchBlocked = await app.request('/api/v1/research', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query: 'Evaluate AI security architecture' }),
+    });
+    expect(researchBlocked.status).toBe(402);
+
+    const coderBlocked = await app.request('/api/v1/coder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ taskType: 'review', language: 'TypeScript', prompt: 'Audit auth module' }),
+    });
+    expect(coderBlocked.status).toBe(402);
+  });
+
+  it('prevents concurrent double-deduction overdraft and retries transient 502 once', async () => {
+    const store = createStore();
+    store.credits.set('race-user', { balance: 5, monthlyAllowance: 100 });
+
+    const results = await Promise.allSettled([
+      Promise.resolve().then(() => deductCreditsAtomic(store, { userId: 'race-user', amount: 4, reason: 'Op 1', referenceId: 'r1' })),
+      Promise.resolve().then(() => deductCreditsAtomic(store, { userId: 'race-user', amount: 4, reason: 'Op 2', referenceId: 'r2' })),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(store.credits.get('race-user')?.balance).toBe(1);
+
+    // Transient 502 retry test on OpenAI adapter
+    let calls = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Response('Bad gateway', { status: 502 });
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: 'Recovered after retry' } }],
+            usage: { prompt_tokens: 10, completion_tokens: 4 },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }),
+    );
+
+    const cfg = getServerConfig({ AVAREST_ENVIRONMENT: 'staging', OPENAI_API_KEY: 'sk-live-test-key' });
+    const completion = await executeProviderCompletion({
+      providerId: 'openai',
+      modelId: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: 'ping' }],
+      config: cfg,
+    });
+    expect(calls).toBe(2);
+    expect(completion.text).toBe('Recovered after retry');
+    expect(completion.usageIsEstimated).toBe(false);
+  });
+
+  it('executes Cloudflare Workers entrypoint with RATE_LIMIT_KV binding and scopes SQL migration policies', async () => {
+    const kvStore = new Map<string, string>();
+    const env = {
+      AVAREST_ENVIRONMENT: 'staging',
+      RATE_LIMIT_KV: {
+        async get(key: string) {
+          return kvStore.get(key) ?? null;
+        },
+        async put(key: string, value: string) {
+          kvStore.set(key, value);
+        },
+      },
+    };
+
+    const res = await workerApp.fetch(new Request('https://staging.avarestai.com/api/v1/health'), env);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { rateLimitMode: string; environment: string };
+    expect(json.environment).toBe('staging');
+    expect(json.rateLimitMode).toBe('distributed_kv');
+
+    const sqlPath = path.resolve(process.cwd(), 'supabase/migrations/0002_security_hardening.sql');
+    const sql = fs.readFileSync(sqlPath, 'utf-8');
+    expect(sql).toContain('usage_is_estimated');
+    expect(sql).toContain('credit_accounts_owner_select ON public.credit_accounts FOR SELECT TO authenticated');
   });
 });

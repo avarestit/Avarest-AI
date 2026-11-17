@@ -98,6 +98,39 @@ export async function executeProviderCompletion(params: {
   config: ResolvedServerConfig;
   signal?: AbortSignal;
 }): Promise<ProviderCompletionResult> {
+  const maxAttempts = 2;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (params.signal?.aborted) {
+      throw new ProviderExecutionError(params.providerId, sanitizeProviderErrorMessage(params.providerId, 499, 'abort'), 499);
+    }
+    try {
+      return await executeProviderCompletionOnce(params);
+    } catch (err) {
+      lastErr = err;
+      const isRetryable =
+        err instanceof ProviderExecutionError &&
+        (err.statusCode === 502 || err.statusCode === 503 || err.statusCode === 504) &&
+        !err.message.toLowerCase().includes('not configured') &&
+        !err.message.toLowerCase().includes('disabled');
+      if (!isRetryable || attempt === maxAttempts || params.signal?.aborted) {
+        throw err;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+    }
+  }
+  throw lastErr;
+}
+
+async function executeProviderCompletionOnce(params: {
+  providerId: ProviderId;
+  modelId: string;
+  messages: ProviderMessage[];
+  systemInstruction?: string;
+  enableWebSearch?: boolean;
+  config: ResolvedServerConfig;
+  signal?: AbortSignal;
+}): Promise<ProviderCompletionResult> {
   const { providerId, modelId, messages, systemInstruction, enableWebSearch, config } = params;
 
   if (!isProviderEnabledForRelease(providerId)) {
