@@ -1,0 +1,7 @@
+{
+  "name": "Avarest One",
+  "description": "One Platform. Every Intelligence. Unified AI workspace powered by Avarest Brain.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
