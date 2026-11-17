@@ -1,0 +1,26 @@
+# ==============================================================================
+# AVAREST ONE — CLOUDFLARE WORKERS CONFIGURATION
+# Do NOT put secrets in this file. Use `wrangler secret put` for keys.
+# ==============================================================================
+name = "avarest-one-api"
+main = "src/worker.ts"
+compatibility_date = "2025-11-01"
+
+[vars]
+AVAREST_ENVIRONMENT = "staging"
+SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
+APP_URL = "https://staging.avarestai.com"
+
+[env.staging]
+name = "avarest-one-api-staging"
+[env.staging.vars]
+AVAREST_ENVIRONMENT = "staging"
+SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
+APP_URL = "https://staging.avarestai.com"
+
+[env.production]
+name = "avarest-one-api-production"
+[env.production.vars]
+AVAREST_ENVIRONMENT = "production"
+SUPABASE_URL = "https://zdvhksmtxelxcudssdus.supabase.co"
+APP_URL = "https://avarestai.com"

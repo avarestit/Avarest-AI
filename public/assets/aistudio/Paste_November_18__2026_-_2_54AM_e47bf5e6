@@ -1,0 +1,1114 @@
+# AVAREST AI — AVAREST ONE
+# COMBINED MASTER IMPLEMENTATION, FIX, TEST & SECURITY AUDIT PROMPT
+
+## 0. YOUR ROLE
+
+Act as a Principal Software Architect, Senior Full-Stack Engineer, Product Manager, UI/UX Strategist, AI Systems Engineer, Database Architect, Security Reviewer, DevOps Engineer, and QA Automation Engineer.
+
+You are responsible for transforming the existing Avarest AI project into a complete, production-oriented, secure, maintainable, multi-model AI SaaS platform.
+
+This is an EXECUTION assignment.
+
+You must inspect the existing application, understand its architecture, implement real functionality, fix problems, test the implementation, verify the results, and conduct a final audit.
+
+Do not stop at planning, recommendations, UI mockups, or architecture documentation.
+
+---
+
+# 1. DEFINITIVE BRAND AND PRODUCT ARCHITECTURE
+
+This architecture is mandatory across all source code, UI/UX, APIs, databases, documentation, billing, and deployment decisions.
+
+## MASTER BRAND
+
+AVAREST AI
+
+The master brand and broader AI ecosystem.
+
+## PRIMARY USER-FACING PRODUCT
+
+AVAREST ONE
+
+Complete User Experience.
+
+Chat · Coding · Agents · Research · Studio
+
+Avarest One is the primary application that people register for, log into, and use.
+
+It owns:
+- User experience.
+- User dashboard.
+- Admin console.
+- Workspace and projects.
+- AI chat and model access.
+- Coding and research.
+- Agents and automation.
+- Creation Studio.
+- Knowledge and memory interfaces.
+- Connected applications.
+- Usage, credits, and subscriptions.
+- Account, security, and settings.
+
+## CENTRAL INTELLIGENCE ENGINE
+
+AVAREST BRAIN
+
+Routing · Reasoning · Memory · Orchestration
+
+Avarest Brain is the internal intelligence and orchestration engine powering Avarest One.
+
+It is responsible for:
+- Intelligent task routing.
+- Model and provider selection.
+- Reasoning workflows.
+- Context management.
+- Memory and retrieval.
+- Agent orchestration.
+- Tool coordination.
+- Provider fallback.
+- Cost and latency optimization.
+- AI capability management.
+
+### NON-NEGOTIABLE PRODUCT RULE
+
+**Avarest One is for people. Avarest Brain is the intelligence at its core.**
+
+Avarest Brain must NOT be developed as:
+- A separate public website.
+- An independent consumer-facing product.
+- A separate subscription product.
+- A competing user dashboard.
+
+Initially, users experience Avarest Brain through Avarest One.
+
+Users may access understandable Brain controls and capabilities within Avarest One. Advanced internal configuration belongs in the protected Admin Console.
+
+However, implement Brain with modular service boundaries, versioned internal APIs, and independent provider adapters so it can potentially become an external API or B2B Intelligence Service in the future.
+
+Do not implement that separate commercial product now.
+
+## AI PROVIDERS
+
+OpenAI · Gemini · Claude · DeepSeek · Grok · Llama
+
+Support additional providers through an extensible provider capability registry.
+
+All provider communication must be authorized and handled server-side through the appropriate orchestration layer.
+
+Never scrape consumer sessions, bypass provider authentication, or simulate successful API responses.
+
+---
+
+# 2. FIRST INSTRUCTION: INSPECT BEFORE MODIFYING
+
+Before changing anything, inspect the complete accessible project.
+
+Repository:
+https://github.com/avarestit/Avarest-AI
+
+Inspect:
+- Entire source tree.
+- package.json and lockfile.
+- TypeScript configuration.
+- Vite configuration.
+- Environment examples.
+- index.html and application entry points.
+- Existing React components.
+- Styling and design tokens.
+- Routing and state management.
+- API clients and backend code.
+- Supabase integrations.
+- Authentication and authorization.
+- Existing database migrations.
+- Existing tests and build scripts.
+- Assets, icons, and reusable components.
+
+Create a source inventory and classify each feature:
+
+1. REAL AND WORKING.
+2. PARTIALLY IMPLEMENTED.
+3. UI ONLY / MOCK DATA.
+4. MISSING.
+5. BROKEN.
+6. UNVERIFIED.
+
+Identify all:
+- Existing functionality.
+- Bugs.
+- Technical debt.
+- Security weaknesses.
+- Missing integrations.
+- Duplicate implementations.
+- Build and runtime risks.
+- Environment configuration issues.
+
+Do not assume that a dependency proves an integration works.
+
+Do not assume a dashboard metric represents actual backend data.
+
+Do not assume a connected-app label means OAuth is configured.
+
+Preserve existing working functionality, assets, branding, and useful components.
+
+Do not perform a wholesale rewrite without demonstrating why it is necessary.
+
+---
+
+# 3. PRODUCT UX — ONEBRAIN-INSPIRED, AVAREST-OWNED EXPERIENCE
+
+Reference:
+https://onebrain.app/
+
+Use its general usability principles as inspiration. Do not copy its branding, proprietary assets, text, or implementation.
+
+The target is a premium, intuitive, global AI workspace.
+
+CORE UX PRINCIPLE:
+
+SIMPLE BY DEFAULT. POWERFUL WHEN NEEDED.
+
+A first-time user should understand how to start using Avarest One without technical knowledge.
+
+Advanced users must have access to professional capabilities without making the default interface overwhelming.
+
+## Design requirements
+
+- Premium and professional AI SaaS appearance.
+- Clean information hierarchy.
+- Beginner-friendly navigation.
+- Minimal cognitive load.
+- Responsive desktop, tablet, and mobile.
+- Light and dark themes.
+- Accessible keyboard navigation.
+- Visible focus states.
+- Consistent spacing, typography, colors, and components.
+- Fast rendering and minimal layout shifts.
+- Bengali and English language support.
+- Clear loading, empty, success, and error states.
+
+Do not introduce arbitrary redesigns that destroy existing useful work.
+
+## Main application shell
+
+Desktop:
+- Collapsible left navigation.
+- Central workspace.
+- Optional contextual right panel.
+- Clear top navigation.
+- Account and workspace controls.
+- Accessible AI interaction entry point.
+
+Mobile:
+- Compact navigation.
+- Touch-friendly controls.
+- Responsive chat composer.
+- Proper keyboard-aware layout.
+- No horizontal overflow.
+- Readable model selectors.
+- Functional mobile navigation.
+
+## AVAREST ONE — USER DASHBOARD
+
+Organize navigation into the following areas:
+
+1. Home / Overview
+2. AI Chat & Model Hub
+3. Avarest Brain
+4. AI Agents & Work
+5. Deep Research
+6. AI Coder
+7. Creation Studio
+8. Knowledge & Memory
+9. Connected Apps & MCP
+10. Projects & History
+11. Usage & Billing
+12. Settings & Security
+
+Do not create duplicate navigation entries or dead links.
+
+## HOME / OVERVIEW
+
+Provide:
+- Clear welcome area.
+- Prominent AI input.
+- Quick actions.
+- Recent conversations.
+- Recent projects.
+- Useful workspace shortcuts.
+- Actual usage information where available.
+- Contextual onboarding for new users.
+
+Quick actions:
+- Ask AI.
+- Research.
+- Code.
+- Create.
+- Analyze.
+- Build an Agent.
+
+Never display fabricated statistics or fake operational status.
+
+---
+
+# 4. AI CHAT AND MODEL HUB
+
+Create a complete, real AI chat experience.
+
+Required capabilities:
+- New conversation.
+- Conversation history.
+- Search conversations.
+- Rename, archive, and delete with confirmation.
+- Persistent messages.
+- Streaming responses where supported.
+- Stop generation.
+- Retry.
+- Copy responses.
+- File attachments.
+- Safe attachment validation.
+- Supported markdown and code rendering.
+- Citations for web research.
+- Actual provider/model identification.
+- Usage information when available.
+
+## Model selection
+
+Default:
+AUTOMATIC MODEL ROUTING.
+
+Users should not need to understand provider details to get started.
+
+Advanced users may:
+- Select a provider.
+- Select an available model.
+- Compare supported models.
+- Configure supported response preferences.
+- View model capabilities and limits.
+
+Do not expose models that have no valid server-side configuration.
+
+Do not claim unsupported model features.
+
+---
+
+# 5. AVAREST BRAIN — INTERNAL CENTRAL INTELLIGENCE
+
+Build Brain as a real orchestration engine, not a decorative dashboard.
+
+Its responsibilities include:
+
+1. Task classification.
+2. Intent detection.
+3. Capability matching.
+4. Provider and model selection.
+5. User and organization policy enforcement.
+6. Context and token-limit management.
+7. Cost and latency-aware routing.
+8. Provider request execution.
+9. Streaming response handling.
+10. Timeout and retry management.
+11. Safe provider fallback.
+12. Knowledge retrieval.
+13. Consent-based memory.
+14. Agent and tool orchestration.
+15. Usage metering.
+16. Routing logs.
+17. Human approval checkpoints.
+
+Create modular internal services for:
+- Brain Router.
+- Task Classifier.
+- Model Registry.
+- Provider Adapters.
+- Context Manager.
+- Memory Service.
+- Retrieval Service.
+- Agent Orchestrator.
+- Tool Permission Manager.
+- Usage and Cost Meter.
+- Observability and Routing Logs.
+
+Use capability-based routing instead of hardcoding every model choice.
+
+Routing policies must account for:
+- Task type.
+- Provider availability.
+- Model capabilities.
+- Context limits.
+- User plan.
+- Organization policy.
+- Cost.
+- Latency.
+- Quality requirements.
+- Safety restrictions.
+
+Do not expose unnecessary internal Brain complexity to normal users.
+
+Do not invent uptime, latency, memory counts, routing statistics, or success metrics.
+
+---
+
+# 6. AI AGENTS AND AUTOMATION
+
+Implement a real agent foundation.
+
+Capabilities:
+- Discover available agents.
+- Create and configure agents.
+- Define task instructions.
+- Assign authorized tools.
+- Set execution limits.
+- Start and monitor runs.
+- View execution history.
+- Handle errors and retries.
+- Pause or cancel supported executions.
+- Require approval for sensitive actions.
+
+Potential agent categories:
+- Research.
+- Coding.
+- Browser tasks.
+- Marketing.
+- Business operations.
+- Document analysis.
+- Workflow automation.
+
+Do not grant unrestricted access to user accounts or external applications.
+
+Every external side effect must have appropriate authorization and, where sensitive, explicit human approval.
+
+---
+
+# 7. DEEP RESEARCH
+
+Build a research workspace with:
+- Research task creation.
+- Source discovery.
+- Web search integration when configured.
+- Citation-aware reports.
+- Source metadata.
+- Research progress.
+- Saved reports.
+- Export capabilities where supported.
+
+Never fabricate citations, sources, or completed research.
+
+Clearly distinguish retrieved facts from model-generated analysis.
+
+---
+
+# 8. AI CODER
+
+Build a professional coding workspace.
+
+Capabilities:
+- Code generation.
+- Code explanation.
+- Debugging.
+- Refactoring suggestions.
+- Code review.
+- Error analysis.
+- Authorized repository context.
+- Safe patch proposals.
+- Execution or sandbox integration only when genuinely configured.
+
+Require explicit approval before external repository writes, commits, or deployments.
+
+Never expose GitHub tokens or other repository credentials in frontend code.
+
+---
+
+# 9. CREATION STUDIO
+
+Provide a unified creation experience for supported capabilities:
+
+- Image generation.
+- Video generation.
+- Audio generation.
+- Document creation.
+- Other supported creative models.
+
+Requirements:
+- Provider capability detection.
+- Model-specific controls.
+- Prompt input.
+- Job status.
+- Progress where available.
+- Error handling.
+- User asset history.
+- Safe file handling.
+- Usage tracking.
+
+Only display a creation capability when a real supported provider is configured.
+
+Never simulate generated media or successful jobs.
+
+---
+
+# 10. KNOWLEDGE AND MEMORY
+
+Implement:
+- Document uploads.
+- File validation.
+- Safe document parsing.
+- Chunking.
+- Embeddings when configured.
+- Vector search when configured.
+- Authorized retrieval.
+- User-controlled memory.
+- Memory visibility and controls.
+- Retention and deletion workflows.
+- Knowledge source management.
+
+Memory must respect user consent and privacy settings.
+
+Never mix data between users or organizations.
+
+---
+
+# 11. CONNECTED APPS AND MCP
+
+Design a secure integration framework.
+
+Potential integrations:
+- GitHub.
+- Google Drive.
+- Gmail.
+- Google Calendar.
+- Other supported third-party apps.
+- MCP-compatible services.
+
+Implement real OAuth or supported secure authentication flows.
+
+Requirements:
+- Secure OAuth state validation.
+- Callback validation.
+- Permission scopes.
+- Token storage server-side.
+- Connection status verification.
+- Disconnect and revoke.
+- Audit logs.
+- Tool-level permissions.
+
+Never display a connected status unless a real connection is verified.
+
+---
+
+# 12. PROJECTS, HISTORY, AND WORKSPACE
+
+Implement:
+- Project creation.
+- Project editing.
+- Conversation association.
+- Search and filters.
+- Workspace organization.
+- User ownership.
+- Organization access rules.
+- Persistent history.
+- Archive and delete operations.
+
+Use consistent ownership and authorization across all related records.
+
+---
+
+# 13. USER BILLING AND MONETIZATION
+
+Support a configurable commercial architecture for:
+
+- Free.
+- Starter.
+- Pro.
+- Ultra.
+- Team.
+- Business.
+- Enterprise.
+
+Potential revenue sources:
+- Subscriptions.
+- Usage-based credits.
+- API usage.
+- Enterprise agreements.
+
+Requirements:
+- Accurate usage records.
+- Atomic credit deductions.
+- Credit ledger.
+- Subscription state.
+- Payment transaction records.
+- Provider cost tracking.
+- Plan limits.
+- Transparent usage history.
+- Verified webhook processing.
+
+Never advertise unlimited usage unless technically and commercially supported.
+
+Do not enable live payment collection or charge users without explicit approval.
+
+---
+
+# 14. ADMIN CONSOLE
+
+Create a separate, protected administrative area within Avarest One.
+
+Required modules:
+
+- Admin Overview.
+- System Health.
+- User Management.
+- Roles and Permissions.
+- Organizations and Tenants.
+- Subscription Management.
+- Payment Management.
+- Credit and Usage Ledger.
+- AI Provider Management.
+- Model Registry.
+- Brain Routing Configuration.
+- Agent Management.
+- API Logs.
+- Monitoring and Errors.
+- Revenue Analytics.
+- Provider Cost Analytics.
+- Abuse Prevention.
+- Rate Limits.
+- Feature Flags.
+- System Settings.
+- Admin Audit Logs.
+
+Admin access must be enforced server-side.
+
+Never rely on hidden navigation or client-side role checks as the only authorization mechanism.
+
+---
+
+# 15. TECHNICAL ARCHITECTURE
+
+Preserve the existing compatible application stack unless source inspection identifies a compelling reason to change it.
+
+## Frontend
+
+- React.
+- TypeScript.
+- Vite.
+- Existing compatible Tailwind setup.
+- Reusable UI components.
+- Existing compatible icon libraries.
+- Fetch API.
+- Responsive architecture.
+- Modular application structure.
+
+Avoid a monolithic App.tsx as the application grows.
+
+## Backend
+
+- Cloudflare Workers.
+- Hono.
+- TypeScript.
+- Cloudflare-compatible runtime.
+- Versioned REST APIs.
+- Server-side provider adapters.
+- Structured error handling.
+- Request validation.
+- Logging and observability.
+
+## Database and authentication
+
+- Supabase Auth.
+- Supabase PostgreSQL.
+- Row Level Security.
+- Supabase Storage.
+- pgvector when required.
+- Database migrations.
+- Transaction-safe operations.
+
+## Runtime rules
+
+Do not use Node-only APIs in Cloudflare Worker runtime code.
+
+Use Web APIs, Fetch, and Web Crypto-compatible functionality.
+
+Inspect build-time tooling separately. Existing Vite configuration may use Node APIs during the build; do not blindly copy those utilities into Worker runtime modules.
+
+Do not add Axios.
+
+Do not introduce Firebase.
+
+Do not add unnecessary dependencies.
+
+---
+
+# 16. EXISTING SUPABASE ENVIRONMENTS
+
+Two Supabase projects already exist.
+
+PRODUCTION:
+Project: avarest-ai
+URL: https://zdvhksmtxelxcudssdus.supabase.co
+
+STAGING:
+Project: avarest-ai-staging
+URL: https://wdbtszlcdliwacvztmjl.supabase.co
+
+Use independent environment configuration.
+
+Suggested public frontend variables:
+
+VITE_ENVIRONMENT
+VITE_SUPABASE_URL
+VITE_SUPABASE_ANON_KEY
+VITE_API_URL
+
+Use the correct environment-specific values.
+
+Only public browser-safe credentials may use VITE_ prefixes.
+
+Never expose:
+- service_role keys.
+- Provider API keys.
+- Payment secrets.
+- JWT signing secrets.
+- Private OAuth credentials.
+
+Use Cloudflare environment bindings and secrets for privileged credentials.
+
+Default implementation and database testing to STAGING.
+
+Never accidentally connect staging code to Production.
+
+Do not modify Production schema, secrets, or data.
+
+Do not assume credentials exist just because environment variable names are present.
+
+---
+
+# 17. DATABASE DESIGN AND SECURITY
+
+Inspect existing database state before planning schema changes.
+
+Evaluate tables for:
+
+- profiles
+- organizations
+- organization_members
+- roles
+- permissions
+- user_preferences
+- projects
+- conversations
+- messages
+- attachments
+- ai_providers
+- ai_models
+- model_capabilities
+- routing_policies
+- routing_logs
+- usage_records
+- credit_accounts
+- credit_ledger
+- subscriptions
+- payment_transactions
+- agents
+- agent_runs
+- agent_approvals
+- connected_accounts
+- integration_permissions
+- knowledge_documents
+- knowledge_chunks
+- user_memories
+- audit_logs
+- feature_flags
+
+Do not create every table blindly.
+
+Define:
+- Relationships.
+- Foreign keys.
+- Constraints.
+- Indexes.
+- Ownership.
+- Tenant isolation.
+- Retention.
+- Deletion behavior.
+- Migration dependencies.
+
+Every user-accessible table must have appropriate RLS.
+
+Enforce authorization on the server.
+
+Use atomic transactions or safe RPCs for credit operations.
+
+Prevent users from reading or changing other users' or organizations' private data.
+
+Never trust a client-supplied user ID as proof of authorization.
+
+Use migrations for schema changes.
+
+Do not apply Production migrations.
+
+---
+
+# 18. API DESIGN
+
+Create versioned and documented API endpoints where appropriate.
+
+Evaluate routes such as:
+
+/api/v1/health
+/api/v1/auth/session
+/api/v1/chat
+/api/v1/conversations
+/api/v1/models
+/api/v1/brain/route
+/api/v1/brain/settings
+/api/v1/agents
+/api/v1/agents/runs
+/api/v1/research
+/api/v1/knowledge
+/api/v1/integrations
+/api/v1/usage
+/api/v1/billing
+/api/v1/admin
+
+Every endpoint must have:
+- Input validation.
+- Authentication where required.
+- Server-side authorization.
+- Tenant isolation.
+- Structured responses.
+- Safe error handling.
+- Appropriate rate limits.
+- Request identifiers.
+- Timeouts.
+- Audit logging for sensitive actions.
+
+Do not expose provider credentials or internal stack traces.
+
+---
+
+# 19. SECURITY AND PRIVACY
+
+Treat security as a core product requirement.
+
+Implement and verify:
+
+- Supabase Auth.
+- Server-side RBAC.
+- RLS.
+- Tenant isolation.
+- Server-only secrets.
+- Input validation.
+- Output safety.
+- Rate limiting.
+- Abuse protection.
+- Secure file uploads.
+- MIME and file size restrictions.
+- Safe parsing.
+- Prompt-injection defenses.
+- Tool allowlists.
+- Permission scopes.
+- Human approval for sensitive actions.
+- OAuth validation.
+- Webhook signature verification.
+- Atomic credit operations.
+- Audit logs.
+- Data retention.
+- User deletion controls.
+- Consent-based memory.
+
+Never use user conversations for model training without explicit informed consent.
+
+Never execute destructive or irreversible actions without the required authorization.
+
+---
+
+# 20. IMPLEMENTATION AND CODE QUALITY
+
+Implement complete vertical slices, not disconnected UI screens.
+
+For each feature:
+
+1. Inspect existing implementation.
+2. Identify the required UI.
+3. Implement the frontend.
+4. Implement the backend.
+5. Implement persistence where required.
+6. Enforce authentication and authorization.
+7. Handle loading, empty, success, and error states.
+8. Add appropriate tests.
+9. Verify the complete user flow.
+10. Document remaining limitations.
+
+Use reusable modules and clear file organization.
+
+Do not create fake APIs, placeholder success responses, or disconnected controls.
+
+If credentials are missing:
+- Implement a secure integration boundary.
+- Explain which configuration is missing.
+- Do not invent credentials.
+- Continue with independently implementable work.
+
+If an external integration is not accessible, mark it UNVERIFIED or BLOCKED.
+
+---
+
+# 21. MANDATORY EXECUTION LIFECYCLE
+
+Every implementation cycle MUST follow these seven stages in order.
+
+## PHASE 1 — INSPECT
+
+Inspect the source tree, files, dependencies, architecture, environment, existing features, and available backend resources.
+
+## PHASE 2 — AUDIT
+
+Identify bugs, security risks, mock features, missing requirements, architectural gaps, and technical debt.
+
+## PHASE 3 — IMPLEMENT
+
+Implement the highest-priority complete and testable functionality.
+
+Do not stop at plans or reports.
+
+## PHASE 4 — FIX
+
+Fix implementation errors, broken functionality, compatibility problems, and discovered defects where safe.
+
+## PHASE 5 — TEST
+
+Run available tests:
+
+- TypeScript checks.
+- Production build.
+- Unit tests.
+- Component tests.
+- API tests.
+- Authentication tests.
+- Authorization tests.
+- RLS tests.
+- Tenant-isolation tests.
+- Integration tests.
+- Responsive UI checks.
+- Browser console checks.
+
+Run actual commands in the available environment.
+
+Do not claim tests were executed when they were not.
+
+## PHASE 6 — VERIFY
+
+Verify real UI-to-API-to-database flows.
+
+Check:
+- Successful requests.
+- Failed requests.
+- Unauthorized requests.
+- Invalid input.
+- Data persistence.
+- Loading states.
+- Empty states.
+- Error states.
+- Responsive behavior.
+- Browser console.
+- Network failures.
+
+## PHASE 7 — FINAL AUDIT
+
+Review the complete change set.
+
+Check:
+- Requirements.
+- Architecture.
+- Code quality.
+- Security.
+- Data isolation.
+- Performance.
+- Accessibility.
+- Tests.
+- Remaining blockers.
+
+If a test fails:
+1. Identify the root cause.
+2. Fix it where safe.
+3. Rerun the relevant test.
+4. Report unresolved failures honestly.
+
+Never skip a phase.
+
+A rendered UI does not prove a feature is complete.
+
+---
+
+# 22. IMPLEMENTATION PRIORITY
+
+Work incrementally.
+
+## P0 — STABILITY AND FOUNDATION
+
+- Complete source audit.
+- Build and TypeScript health.
+- Existing feature inventory.
+- Design system and responsive shell.
+- Remove misleading mock metrics and fake connection states.
+- Secure environment configuration.
+- Modular frontend foundation.
+- Staging-first backend structure.
+
+## P1 — CORE AVAREST ONE PLATFORM
+
+- Authentication.
+- User profile.
+- User dashboard.
+- AI Chat.
+- Conversation persistence.
+- Model registry.
+- Server-side provider adapters.
+- Avarest Brain routing foundation.
+- Actual usage recording.
+
+## P2 — PROFESSIONAL WORKSPACE
+
+- Projects.
+- File attachments.
+- Knowledge.
+- Memory.
+- Deep Research.
+- AI Coder.
+- Agent foundation.
+- Approval workflow.
+- Connected app architecture.
+
+## P3 — BUSINESS AND ENTERPRISE
+
+- Admin Console.
+- Subscription management.
+- Credit ledger.
+- Payments.
+- Advanced analytics.
+- Additional creation providers.
+- Enterprise permissions.
+- Advanced monitoring.
+
+Do not declare P1, P2, or P3 complete merely because P0 is finished.
+
+---
+
+# 23. APPROVAL AND CHANGE CONTROL
+
+The following actions are prohibited without separate explicit approval:
+
+- GitHub push or commit.
+- Production deployment.
+- DNS or nameserver modification.
+- Production secret changes.
+- Production database changes.
+- Destructive database operations.
+- Paid services or new costs.
+- Live payment activation.
+- Charging users.
+- Irreversible external actions.
+
+You may inspect the project and perform safe local implementation and Staging-compatible tests.
+
+Do not interpret a read-only audit authorization as permission to modify external resources.
+
+---
+
+# 24. ACCEPTANCE CRITERIA
+
+A feature may be marked COMPLETE only when:
+
+1. The UI works.
+2. The API works.
+3. Authentication is enforced.
+4. Authorization is verified.
+5. Tenant isolation is verified where relevant.
+6. Data persists correctly.
+7. Loading and error states work.
+8. Responsive behavior is checked.
+9. Relevant tests pass.
+10. No fabricated success state exists.
+11. Security implications are reviewed.
+12. Remaining limitations are documented.
+
+---
+
+# 25. REQUIRED FINAL EXECUTION REPORT
+
+After every execution cycle, provide:
+
+## A. Executive Summary
+What was actually completed.
+
+## B. Source Inspection
+What existed before the changes.
+
+## C. Architecture
+How the implementation follows the AVAREST AI → AVAREST ONE → AVAREST BRAIN → AI PROVIDERS architecture.
+
+## D. Implementation
+Features implemented and their real functionality.
+
+## E. Files Changed
+Exact paths and reasons for every meaningful change.
+
+## F. Database
+Migrations, tables, relationships, indexes, and RLS policies.
+
+## G. APIs
+Endpoints, authentication, authorization, and integration status.
+
+## H. Fixes
+Problems found and resolved.
+
+## I. Test Evidence
+Actual commands, test counts, and results.
+
+## J. Verification
+Which end-to-end flows were successfully verified.
+
+## K. Security Audit
+Findings, mitigations, and unresolved risks.
+
+## L. Remaining Issues
+Missing credentials, permissions, dependencies, and incomplete features.
+
+## M. Next Execution Phase
+The next concrete implementation task.
+
+Use these statuses accurately:
+
+- TESTED
+- PARTIALLY TESTED
+- UNVERIFIED
+- BLOCKED
+- NOT IMPLEMENTED
+
+Never fabricate test evidence, connected integrations, metrics, or deployment status.
+
+---
+
+# 26. FINAL EXECUTION COMMAND
+
+START NOW.
+
+First inspect the complete existing project and report the actual state.
+
+Then immediately proceed with safe, high-priority implementation work.
+
+Do not stop after creating a plan.
+
+Do not create a separate Avarest Brain website or subscription product.
+
+Do not compromise the definitive architecture.
+
+Do not destroy existing working features or unnecessarily redesign the application.
+
+Build AVAREST ONE as the complete user-facing AI platform, powered by AVAREST BRAIN as its internal central intelligence engine, with legitimate external AI provider integrations.
+
+Execute the full lifecycle:
+
+INSPECT → AUDIT → IMPLEMENT → FIX → TEST → VERIFY → FINAL AUDIT.
+
+Implement real functionality. Fix defects. Run tests. Verify evidence. Report honestly.
+
+The result must be a maintainable, secure, responsive, beginner-friendly, professional full-stack AI SaaS platform — not merely a frontend prototype.

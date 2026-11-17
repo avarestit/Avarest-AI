@@ -2,8 +2,23 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @layer base {
+  :root {
+    font-family: "DM Sans", "Noto Sans Bengali", system-ui, -apple-system, sans-serif;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: "Plus Jakarta Sans", "Noto Sans Bengali", system-ui, -apple-system, sans-serif;
+  }
+
+  code, pre, .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  }
+
   body {
-    @apply antialiased selection:bg-indigo-500 selection:text-white;
+    @apply antialiased bg-slate-50 text-slate-900 dark:bg-[#070B14] dark:text-slate-100 selection:bg-indigo-600 selection:text-white;
   }
 }
 
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
