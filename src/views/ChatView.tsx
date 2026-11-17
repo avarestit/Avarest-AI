@@ -553,7 +553,9 @@ export function ChatView({
                   {msg.outputTokens > 0 && (
                     <>
                       <span>·</span>
-                      <span className="font-mono">{msg.inputTokens + msg.outputTokens} tok</span>
+                      <span className="font-mono">
+                        {msg.inputTokens + msg.outputTokens} tok{msg.usageIsEstimated ? ' (est.)' : ''}
+                      </span>
                     </>
                   )}
                 </div>

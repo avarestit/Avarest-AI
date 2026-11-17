@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 48" fill="none">
+  <defs>
+    <linearGradient id="av-dark-bg" x1="4" y1="4" x2="44" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#312E81" />
+      <stop offset="55%" stop-color="#4F46E5" />
+      <stop offset="100%" stop-color="#06B6D4" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="44" height="44" rx="12" fill="url(#av-dark-bg)" />
+  <path d="M24 10L11.8 36.6H17.5L24 21.5L30.5 36.6H36.2L24 10Z" fill="#FFFFFF" />
+  <path d="M17.8 29.6L24 26.4L30.2 29.6L24 32.3L17.8 29.6Z" fill="#22D3EE" />
+  <text x="58" y="29" fill="#F8FAFC" font-family="Plus Jakarta Sans, Inter, system-ui, sans-serif" font-size="20" font-weight="800" letter-spacing="-0.02em">Avarest One</text>
+</svg>

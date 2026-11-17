@@ -1,0 +1,996 @@
+# AVAREST ONE — POST-COMMIT MASTER UPDATE
+# SOURCE REVIEW, SECURITY HARDENING, SUPABASE INTEGRATION, FINAL UI/UX & BRANDING
+
+## 0. ROLE AND EXECUTION AUTHORITY
+
+Act as the Principal Software Architect, Senior Full-Stack Engineer, UI/UX Strategist, AI Systems Engineer, Database Architect, Application Security Engineer, and QA Lead for Avarest AI.
+
+You are continuing an existing implementation. This is NOT a greenfield rebuild.
+
+Repository:
+https://github.com/avarestit/Avarest-AI
+
+Baseline commit to inspect:
+https://github.com/avarestit/Avarest-AI/commit/73ce1c1d457aa72b3d81902c9609044156769a99
+
+First inspect the actual current working tree and compare it with the baseline commit. Do not assume the repository has not changed since this commit.
+
+Your job is to preserve existing working functionality, fix identified risks, complete missing integrations, and finalize the agreed user experience.
+
+Mandatory lifecycle:
+
+INSPECT → AUDIT → IMPLEMENT → FIX → TEST → VERIFY → FINAL AUDIT.
+
+Do not stop after writing a plan or report. Perform actual safe implementation and verification.
+
+Never claim success without evidence.
+
+---
+
+# 1. DEFINITIVE PRODUCT ARCHITECTURE
+
+This architecture is mandatory and overrides any conflicting implementation.
+
+AVAREST AI = Master Brand.
+
+AVAREST ONE = Complete user-facing AI SaaS platform.
+
+AVAREST BRAIN = Internal central intelligence engine powering Avarest One.
+
+AI PROVIDERS = External model providers connected through Avarest Brain.
+
+Core principle:
+
+"Avarest One is for people. Avarest Brain is the intelligence at its core."
+
+Avarest Brain is NOT a separate public website, consumer product, or separate subscription.
+
+All user-facing features, accounts, projects, billing, dashboards, and settings belong to Avarest One.
+
+Brain must remain modular and independently maintainable, with versioned internal APIs for potential future API/B2B expansion.
+
+Do not create a competing public Brain product.
+
+A simple Brain transparency/settings interface may exist within Avarest One, while advanced routing and provider infrastructure configuration belongs in the protected Admin Console.
+
+---
+
+# 2. CRITICAL SOURCE REVIEW FINDINGS
+
+The previous implementation report and source inspection identified these areas requiring immediate attention.
+
+## A. Demo Account Security
+
+The inspected source contains seeded demo users in:
+
+src/server/lib/store.ts
+
+Examples include:
+- admin@avarestai.com
+- user@avarestai.com
+
+It also contains hardcoded demo passwords and predictable demo account identities.
+
+Required actions:
+
+1. Determine whether these accounts are reachable in any shared or production environment.
+2. Remove hardcoded demo credentials from production-capable code paths.
+3. Never create a default production administrator account or predictable password.
+4. Demo accounts must exist only in an explicitly isolated test fixture or local test environment.
+5. Never seed demo users into real Supabase projects.
+6. Create a secure first-admin provisioning procedure.
+7. Require explicit authorization and audit logging for administrator creation and role changes.
+8. Add regression tests proving demo credentials cannot authenticate in production.
+
+Do not merely hide demo login buttons. Remove the unsafe authentication path.
+
+## B. In-Memory Store Replacement
+
+The current inspected src/server/lib/store.ts uses JavaScript Maps and arrays for workspace state.
+
+This is not persistent production storage.
+
+Replace the production-capable in-memory persistence dependency with real Supabase PostgreSQL operations.
+
+The application must persist:
+- Profiles.
+- Conversations.
+- Messages.
+- Projects.
+- Agents and agent runs.
+- Approvals.
+- Knowledge documents.
+- Memories.
+- Usage records.
+- Credit ledger.
+- Routing logs.
+- Feature flags.
+- Audit logs.
+
+Requirements:
+- Database-backed persistence.
+- Correct ownership enforcement.
+- Tenant isolation.
+- Transaction-safe operations.
+- Pagination.
+- Filtering.
+- Consistent error handling.
+- No cross-user leakage.
+
+The in-memory Store may remain only as an explicitly isolated test fixture or local demo mode. Never silently use it as production persistence.
+
+## C. Database Security Review
+
+Inspect:
+
+supabase/migrations/0001_initial_schema.sql
+
+Review every table, foreign key, constraint, index, RLS policy, RPC, function, grant, and privileged operation.
+
+Pay special attention to:
+
+- public.is_admin()
+- public.is_org_member()
+- public.deduct_credits()
+- organizations
+- organization_members
+- profiles
+- credit_accounts
+- credit_ledger
+- routing_policies
+- audit_logs
+- feature_flags
+- connected_accounts
+
+Security requirements:
+
+1. Every private user or tenant table must have appropriate RLS.
+2. Organization membership must be verified server-side and in applicable policies.
+3. Admin access must never rely on client-side role state.
+4. Users must never be able to assign themselves admin or super_admin.
+5. SECURITY DEFINER functions must use a safe search_path, preferably an empty search_path with fully qualified object references.
+6. Revoke unintended PUBLIC/anon/authenticated execution privileges on privileged functions.
+7. Grant only the minimum required function permissions.
+8. Ensure deduct_credits cannot deduct credits from an arbitrary victim user.
+9. Bind credit deductions to the authenticated principal or restrict execution to a trusted server-only service role with validated ownership.
+10. Prevent negative balances and race-condition double spending.
+11. Validate every SECURITY DEFINER function for privilege escalation.
+12. Verify policies for INSERT, SELECT, UPDATE, and DELETE separately.
+13. Verify RLS with different user identities, not only unit-test mocks.
+
+Do not blindly drop existing Supabase functions or platform-managed event triggers.
+
+Prepare a corrective migration that is safe, reviewable, and idempotent where appropriate.
+
+Do not run destructive SQL.
+
+---
+
+# 3. SUPABASE ENVIRONMENT INTEGRATION
+
+Two existing Supabase projects are available.
+
+STAGING:
+Project: avarest-ai-staging
+URL:
+https://wdbtszlcdliwacvztmjl.supabase.co
+
+PRODUCTION:
+Project: avarest-ai
+URL:
+https://zdvhksmtxelxcudssdus.supabase.co
+
+Strict rules:
+
+- Implement and verify against STAGING first.
+- Never point staging to the production project.
+- Never apply the staging migration to Production.
+- Never expose service_role credentials in frontend code.
+- Never use VITE_ for privileged secrets.
+- Never commit real secrets to GitHub.
+- Validate project/environment isolation at application startup.
+
+Public browser-safe variables:
+
+VITE_ENVIRONMENT
+VITE_SUPABASE_URL
+VITE_SUPABASE_ANON_KEY
+VITE_API_URL
+
+Server-side variables:
+
+AVAREST_ENVIRONMENT
+SUPABASE_URL
+SUPABASE_SERVICE_ROLE_KEY
+AUTH_SESSION_SECRET
+GEMINI_API_KEY
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+DEEPSEEK_API_KEY
+
+Use Supabase Auth as the real identity provider when configured.
+
+Use server-side Supabase operations with proper authorization. Remember that service-role access bypasses RLS; never treat the service role itself as a substitute for application-level authorization.
+
+Where practical, use user-scoped access for user-owned operations. For privileged service-role operations, enforce validated ownership and tenant permissions before querying or mutating data.
+
+Implement actual Supabase-backed authentication, session validation, profile hydration, and persistent role resolution.
+
+Do not use in-memory user roles as the source of production authorization truth.
+
+If credentials are missing, report the exact missing configuration and continue with independently implementable work. Do not silently fall back to in-memory production behavior.
+
+---
+
+# 4. DEFINITIVE PROVIDER STRATEGY — FOUR PROVIDERS ONLY
+
+The first Avarest One release must support these four providers:
+
+1. OpenAI
+2. Google Gemini
+3. Anthropic Claude
+4. DeepSeek
+
+Provider configuration:
+
+GEMINI_API_KEY
+OPENAI_API_KEY
+ANTHROPIC_API_KEY
+DEEPSEEK_API_KEY
+
+All credentials must remain server-side.
+
+Remove xAI Grok and Meta Llama from the active first-release model selection and automatic routing candidates.
+
+Do not delete their future extensibility from the architecture. They may remain disabled provider adapters if that is safe and useful, but they must not appear as active, configured, or available providers.
+
+## Provider Requirements
+
+For each of the four providers:
+
+- Correct API endpoint.
+- Correct current model identifier.
+- Authentication headers.
+- Request and response validation.
+- Timeout and abort handling.
+- Structured error handling.
+- Usage metadata extraction.
+- Token accounting.
+- Capability registry.
+- Provider health verification.
+- Retry policy.
+- Safe fallback.
+- Rate-limit handling.
+
+Verify model availability using the provider's current official API documentation and actual credentials. Do not assume old model identifiers remain available.
+
+Do not fabricate provider configuration or availability.
+
+### Streaming
+
+Implement genuine streaming for every provider where supported.
+
+If a provider adapter does not support native streaming, either implement a documented and verified compatible mechanism or clearly report that it returns a buffered response.
+
+Do not label a buffered response as native provider streaming.
+
+### Provider status
+
+Distinguish:
+- Credential configured.
+- Provider reachable.
+- Model available.
+- Request successful.
+- Provider unavailable.
+
+A configured key alone does not prove that an API is working.
+
+### Cost and usage
+
+Use actual provider usage metadata where available.
+
+Never claim estimated character-based token counts are actual provider billing data.
+
+Clearly label estimates when provider usage metadata is unavailable.
+
+---
+
+# 5. AVAREST BRAIN — IMPROVE EXISTING IMPLEMENTATION
+
+Preserve the existing modular Brain implementation.
+
+Review and improve:
+
+- Task classifier.
+- Capability registry.
+- Model selection.
+- Cost-aware routing.
+- Plan-aware routing.
+- Fallback.
+- Conversation context.
+- Streaming.
+- Memory consent.
+- Knowledge retrieval.
+- Agent orchestration.
+- Tool permission checks.
+- Usage metering.
+- Routing logs.
+
+Automatic routing is the default.
+
+Manual model selection is optional.
+
+Only select models that:
+- Have valid configuration.
+- Are currently available.
+- Support the requested capability.
+- Meet applicable user-plan limits.
+- Meet cost and policy restrictions.
+
+Never retry a failed non-idempotent external action without verifying whether the first action already occurred.
+
+Do not create duplicate billing deductions during retries.
+
+---
+
+# 6. FINAL FRONTEND DESIGN — PRESERVE THE SELECTED REFERENCE EXACTLY
+
+The user has selected the OneBrain-style Simple Interface shown in the previously supplied design reference.
+
+This is the final UI direction.
+
+DO NOT replace it with a card-heavy analytics dashboard.
+
+DO NOT introduce a new design system that conflicts with the selected reference.
+
+DO NOT unnecessarily redesign existing working components.
+
+Reproduce the selected visual structure and interaction principles with original Avarest branding.
+
+## Primary Layout
+
+### Left Sidebar
+
+- Clean, compact navigation.
+- Collapsible desktop sidebar.
+- Minimal icon-led appearance.
+- Clear active item.
+- Responsive mobile drawer.
+- Avoid excessive navigation items.
+
+### Top Bar
+
+- Model selector.
+- Search thread.
+- Invite control where genuinely implemented.
+- New Thread action.
+- Account controls.
+- Theme switcher.
+
+### Central Workspace
+
+- Spacious, distraction-free AI chat area.
+- Centered welcome message.
+- Distinctive original Avarest AI orb/visual identity.
+- Friendly first-use experience.
+- Quick-start prompt suggestions.
+- Clear empty, loading, and error states.
+
+### AI Composer
+
+- Prominent, comfortable input area.
+- Attachment control.
+- Supported action controls.
+- Optional writing/style controls only when functional.
+- Citation or web-research controls only when supported.
+- Send and Stop Generation behavior.
+- Keyboard accessibility.
+
+### Advanced Features
+
+Expose advanced features progressively.
+
+The normal user should not be overwhelmed.
+
+Provide dedicated workspaces for:
+- Agents.
+- Research.
+- Coding.
+- Studio.
+- Knowledge.
+- Projects.
+- Billing.
+- Settings.
+
+Keep the application simple and coherent.
+
+Avarest Brain may appear as an understandable capability or advanced control within Avarest One, not as a separate product or competing dashboard.
+
+### Responsive behavior
+
+Test:
+- Desktop.
+- Tablet.
+- Mobile.
+
+Requirements:
+- No horizontal overflow.
+- Touch-friendly controls.
+- Mobile-friendly composer.
+- Proper navigation drawer.
+- Appropriate text sizing.
+- No clipped dialogs.
+- No broken layout when the mobile keyboard opens.
+
+---
+
+# 7. LIGHT MODE AND DARK MODE
+
+Both themes are mandatory.
+
+Support:
+- Light.
+- Dark.
+- System preference.
+
+Requirements:
+- Accessible theme switcher.
+- Persist user preference.
+- Prevent theme flash during initial rendering where practical.
+- Consistent theme across every page.
+- Correct dropdown, tooltip, modal, form, input, sidebar, composer, and admin styling.
+- Comfortable text contrast.
+- Visible focus states.
+- No unreadable disabled controls.
+
+Light Mode:
+- Clean white/soft-neutral surfaces.
+- Subtle borders.
+- Restrained Avarest purple/blue accents.
+
+Dark Mode:
+- Premium charcoal surfaces.
+- Clear readable text.
+- Restrained violet/blue accents.
+
+Both themes must preserve the same layout and functionality.
+
+---
+
+# 8. UNIQUE AVAREST BRAND IDENTITY
+
+Create an original Avarest logo system.
+
+The logo and icon reference must be inspired by the selected simple AI interface, but must NOT copy OneBrain, OpenAI, or another existing brand.
+
+## Original Logo Concept
+
+Develop a distinctive abstract A-shaped symbol representing:
+- Artificial Intelligence.
+- Intelligence.
+- Connectivity.
+- Innovation.
+- Technology.
+
+Create:
+1. Primary horizontal logo.
+2. Compact logo.
+3. Standalone app icon.
+4. Light-background logo.
+5. Dark-background logo.
+6. Optimized favicon.
+
+Use one consistent symbol and geometry throughout.
+
+## Required Assets
+
+- favicon.ico
+- favicon.svg
+- favicon-16x16.png
+- favicon-32x32.png
+- favicon-48x48.png
+- apple-touch-icon.png (180×180)
+- icon-192.png
+- icon-512.png
+- Suitable SVG logo variants.
+
+Inspect the current asset directory and existing references before adding files.
+
+Use actual generated original artwork or carefully designed SVG assets, not generic placeholder icons.
+
+Do not invent image paths or leave broken references.
+
+## Integration
+
+Update:
+- Sidebar brand.
+- Application header.
+- Login and registration screens.
+- Browser favicon.
+- Page metadata.
+- Web app manifest where applicable.
+- Relevant application branding.
+
+Verify the result in both themes and all responsive breakpoints.
+
+---
+
+# 9. MANDATORY FOOTER — EXACT TEXT AND LINK
+
+Add this exact attribution to the bottom of the user-facing application:
+
+Design & Developed by Avarest Soft
+
+The words "Avarest Soft" must be a real clickable hyperlink:
+
+https://avarestsoft.com/
+
+Implementation requirements:
+- Preserve the exact wording.
+- Do not change it to another variation.
+- Use an actual anchor link.
+- Use the correct HTTPS URL.
+- Use appropriate safe external-link behavior, including rel="noopener noreferrer" when opening a new tab.
+- Visually integrate it with the selected minimal design.
+- Center or align it appropriately at the bottom of the application.
+- Ensure it remains visible and responsive.
+- Support Light Mode and Dark Mode.
+- Do not let it overlap the chat composer or navigation.
+- Include it on relevant user-facing application pages.
+- Keep the Admin Console footer consistent.
+
+Example presentation:
+
+Design & Developed by Avarest Soft
+
+Where "Avarest Soft" is the clickable link.
+
+Do not omit this requirement.
+
+---
+
+# 10. USER DASHBOARD AND ADMIN CONSOLE
+
+Preserve and improve the existing user and admin modules.
+
+## User Platform
+
+- Home.
+- Chat.
+- Agents.
+- Research.
+- Coder.
+- Studio.
+- Knowledge.
+- Projects.
+- Integrations.
+- Billing.
+- Settings.
+- Account security.
+
+Every visible control must work or clearly communicate that its capability is unavailable.
+
+## Admin Console
+
+- Overview.
+- Users.
+- Roles and permissions.
+- Providers and models.
+- Brain routing policies.
+- Usage and credits.
+- Billing configuration.
+- Feature flags.
+- Audit logs.
+- System diagnostics.
+
+All administrative permissions must be verified server-side using persistent trusted roles.
+
+Never rely solely on client-side navigation hiding.
+
+Do not display fabricated system health, revenue, usage, or provider metrics.
+
+---
+
+# 11. AUTHENTICATION AND ACCOUNT SECURITY
+
+Implement Supabase Auth correctly.
+
+Verify:
+- Registration.
+- Login.
+- Logout.
+- Session restoration.
+- Token expiration.
+- Password recovery where configured.
+- Profile persistence.
+- Protected routes.
+- Admin access.
+- Cross-user access prevention.
+
+Ensure:
+- No hardcoded production credentials.
+- No default admin password.
+- No user-controlled privilege escalation.
+- No service-role secret in the browser.
+- No insecure fallback authentication.
+- No production authentication based on in-memory users.
+
+A user must never access another user's private conversations, files, memories, projects, usage, or billing records.
+
+---
+
+# 12. DATABASE AND STORAGE COMPLETION
+
+Review and complete the existing migration architecture.
+
+Use Supabase PostgreSQL as the persistent source of truth.
+
+Evaluate the existing schema before adding new tables.
+
+Requirements:
+- Appropriate indexes.
+- Foreign-key integrity.
+- Transaction safety.
+- RLS coverage.
+- Tenant isolation.
+- Data ownership.
+- Secure RPCs.
+- Safe storage access.
+- Retention and deletion workflows.
+
+Use pgvector only where actual embedding-based retrieval is implemented.
+
+The existing term-scored retrieval may remain as a clearly documented non-vector fallback, but do not describe it as semantic vector search.
+
+Implement real Supabase Storage integration for supported uploaded documents where needed.
+
+Never store uploaded private files in publicly accessible buckets by default.
+
+---
+
+# 13. RATE LIMITING AND EDGE SECURITY
+
+The inspected source currently contains an in-memory sliding-window rate limiter.
+
+This is not sufficient as a globally distributed production rate-limiting strategy.
+
+Evaluate Cloudflare KV or Durable Objects for distributed rate limiting.
+
+Implement a suitable production-ready design with:
+- Per-user limits.
+- Anonymous request limits.
+- Provider-specific limits.
+- Abuse protection.
+- Safe retry behavior.
+- Request IDs.
+- Structured logs.
+
+If a distributed service binding is not yet available, implement an explicit adapter and document the deployment dependency.
+
+Do not pretend in-memory limits are globally consistent.
+
+---
+
+# 14. ENVIRONMENT AND API CONFIGURATION
+
+The inspected `.env.example` contains an empty VITE_API_URL.
+
+Keep configuration explicit.
+
+Production API target, once deployed and verified:
+
+https://api.avarestai.com
+
+Do not assume this domain currently has a deployed Worker or working API.
+
+Staging must use a separately configured staging API URL.
+
+Use:
+
+VITE_API_URL
+
+as the frontend API base URL.
+
+Ensure API requests use the correct configured base URL.
+
+Do not silently route staging traffic to Production.
+
+The API must expose an accurate health endpoint that reports:
+- Environment.
+- Supabase configuration status.
+- Provider configuration status.
+- Actual service availability.
+
+Never return secret values.
+
+Never report a successful database connection if only the environment variable exists.
+
+---
+
+# 15. ERROR HANDLING AND PROVIDER SECURITY
+
+Review all upstream error paths.
+
+Never return raw provider response bodies, credentials, internal stack traces, or sensitive headers to the browser.
+
+Use sanitized structured errors.
+
+Do not log prompts, private documents, access tokens, API keys, or personal information unnecessarily.
+
+Validate:
+- Request sizes.
+- Attachment MIME types.
+- Attachment sizes.
+- JSON payloads.
+- Model identifiers.
+- Conversation ownership.
+- Project ownership.
+- Agent tool permissions.
+
+Add prompt-injection protections and tool allowlists where tools are available.
+
+Sensitive external actions require explicit user approval.
+
+---
+
+# 16. REQUIRED TESTING
+
+Run actual tests in the available environment.
+
+At minimum:
+
+## Build and code quality
+- npm run lint
+- npm test
+- npm run build
+
+## Authentication
+- Registration.
+- Login.
+- Logout.
+- Session restoration.
+- Expired session.
+- Invalid token.
+- Admin authorization.
+
+## Security
+- Demo credential rejection in production.
+- Cross-user data access.
+- Cross-tenant access.
+- Role escalation attempts.
+- RLS verification.
+- SECURITY DEFINER privilege verification.
+- Credit deduction concurrency.
+- Negative balance prevention.
+- Rate-limit behavior.
+- Secret scanning.
+
+## Database
+- Supabase staging connectivity.
+- Migration execution status.
+- CRUD persistence.
+- RLS behavior.
+- Storage authorization.
+- Credit RPC behavior.
+
+## AI Providers
+Test each configured provider independently:
+- Gemini.
+- OpenAI.
+- Anthropic.
+- DeepSeek.
+
+Verify actual API responses only when credentials are configured and valid.
+
+Also test:
+- Missing key.
+- Invalid key.
+- Rate limit.
+- Timeout.
+- Provider error.
+- Fallback.
+- Cancellation.
+- Streaming behavior.
+- Usage extraction.
+
+## UI/UX
+Test:
+- Selected OneBrain-inspired layout.
+- Sidebar.
+- Top bar.
+- Chat composer.
+- New conversation.
+- Conversation history.
+- Model selection.
+- Theme switching.
+- Light Mode.
+- Dark Mode.
+- Logo.
+- Favicon.
+- Footer hyperlink.
+- Admin Console.
+- Mobile and tablet layouts.
+- Browser console.
+- Network failures.
+
+Do not claim browser visual QA if no real browser test was performed.
+
+---
+
+# 17. IMPLEMENTATION ORDER
+
+Prioritize work as follows.
+
+## P0 — Security and Stability
+
+1. Inspect current source and compare with the baseline commit.
+2. Remove unsafe seeded demo credentials from production paths.
+3. Review session/authentication boundaries.
+4. Audit migration security.
+5. Fix privileged function grants and RLS gaps.
+6. Validate environment isolation.
+7. Preserve existing build and tests.
+
+## P1 — Real Supabase Integration
+
+1. Connect Staging Supabase.
+2. Apply a reviewed, non-destructive migration to Staging only when the required credentials and authorization are available.
+3. Replace production in-memory persistence with Supabase-backed repositories.
+4. Implement real Auth and persistent role resolution.
+5. Implement database-backed CRUD.
+6. Verify RLS and ownership.
+7. Verify credit transactions.
+
+## P2 — Four-Provider Brain
+
+1. Keep Gemini working.
+2. Complete OpenAI adapter.
+3. Complete Anthropic adapter.
+4. Complete DeepSeek adapter.
+5. Implement capability-based routing.
+6. Verify fallback and actual usage.
+7. Disable Grok and Llama in the initial release.
+
+## P3 — Final UI, Brand, and UX
+
+1. Preserve the selected simple OneBrain-inspired layout.
+2. Verify exact layout structure.
+3. Finish Light and Dark Mode.
+4. Create original Avarest logo.
+5. Create app icon and favicon assets.
+6. Add exact Avarest Soft footer hyperlink.
+7. Verify all major responsive layouts.
+
+## P4 — Production Readiness
+
+1. Distributed rate-limiting readiness.
+2. Monitoring and structured logging.
+3. Security regression tests.
+4. Full browser verification.
+5. Deployment readiness report.
+6. Remaining integration blockers.
+
+Do not mark a phase complete without evidence.
+
+---
+
+# 18. CHANGE CONTROL
+
+Do not:
+- Push commits.
+- Deploy to Production.
+- Change DNS.
+- Modify Production secrets.
+- Apply Production migrations.
+- Delete Production data.
+- Activate payment collection.
+- Introduce paid services or costs without approval.
+
+Staging implementation is the default target.
+
+If remote Staging access is unavailable, complete safe local implementation and prepare the migration, then report the exact blocker.
+
+Do not request the user to paste private API keys into source files or chat messages.
+
+---
+
+# 19. FINAL ACCEPTANCE CRITERIA
+
+The update is successful only when:
+
+1. Existing functionality is preserved.
+2. Demo credentials cannot authenticate in Production.
+3. Production persistence is Supabase-backed, not in-memory.
+4. Supabase environment isolation is verified.
+5. RLS and privileged RPC permissions are audited.
+6. User and organization data isolation is verified.
+7. Admin privileges are persisted and enforced server-side.
+8. The four selected AI providers are implemented accurately.
+9. Unconfigured providers are honestly marked unavailable.
+10. Automatic and manual model selection work.
+11. The selected simple interface is preserved.
+12. Light and Dark Modes both work.
+13. Original Avarest logo assets are integrated.
+14. App icon and favicon assets are integrated.
+15. The exact footer text and Avarest Soft hyperlink work.
+16. Desktop, tablet, and mobile layouts are verified.
+17. Build and relevant tests pass.
+18. Remaining blockers are documented honestly.
+
+---
+
+# 20. REQUIRED FINAL REPORT
+
+Provide a concise but evidence-based report.
+
+A. Executive Summary.
+
+B. Commit and source comparison.
+
+C. Security findings and fixes.
+
+D. Authentication status.
+
+E. Supabase migration and persistence status.
+
+F. RLS and privileged function audit.
+
+G. Four-provider integration status.
+
+H. Brain routing and fallback status.
+
+I. Frontend design comparison.
+
+J. Light/Dark Mode verification.
+
+K. Logo, app icon, and favicon file paths.
+
+L. Footer hyperlink verification.
+
+M. Responsive QA.
+
+N. Exact files changed.
+
+O. Tests executed and results.
+
+P. Unresolved risks and blockers.
+
+Q. Next recommended execution phase.
+
+Use accurate statuses:
+
+- TESTED
+- PARTIALLY TESTED
+- UNVERIFIED
+- BLOCKED
+- NOT IMPLEMENTED
+
+Do not invent test results or claim a deployment has happened.
+
+# FINAL COMMAND
+
+START NOW.
+
+Inspect the current repository and the supplied baseline commit.
+
+Preserve the existing modular implementation and the selected OneBrain-inspired design.
+
+Prioritize security and real Supabase persistence before expanding features.
+
+Keep the definitive architecture:
+
+AVAREST AI → AVAREST ONE → AVAREST BRAIN → FOUR AI PROVIDERS.
+
+The first release must use OpenAI, Gemini, Claude, and DeepSeek only.
+
+Keep the selected simple frontend, implement both Light and Dark Mode, create original Avarest logo/icon/favicon assets, and add the exact footer:
+
+Design & Developed by Avarest Soft
+
+with Avarest Soft linked to https://avarestsoft.com/.
+
+Execute:
+
+INSPECT → AUDIT → IMPLEMENT → FIX → TEST → VERIFY → FINAL AUDIT.
+
+Do not stop at a plan. Implement, test, verify, and report actual evidence.

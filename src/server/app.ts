@@ -8,36 +8,23 @@ import type {
   ChatMessage,
   ConnectedAccount,
   Conversation,
-  KnowledgeDocument,
-  Project,
   ResearchReport,
 } from '../shared/types.ts';
 import {
   executeProviderCompletion,
+  probeProviderConnectivity,
   ProviderExecutionError,
   streamProviderCompletion,
 } from './brain/providers.ts';
-import { getModelRegistry, getProviderSummary } from './brain/registry.ts';
+import { ACTIVE_PROVIDER_IDS, getModelRegistry, getProviderSummary } from './brain/registry.ts';
 import { BrainRoutingError, routeWithAvarestBrain } from './brain/router.ts';
 import { getServerConfig, type ServerBindings } from './env.ts';
-import { hashPassword, signSessionToken, verifyPassword } from './lib/crypto.ts';
-import {
-  appendAuditLog,
-  chunkTextDocument,
-  deductCreditsAtomic,
-  defaultStore,
-  ensureSeededSandboxAccounts,
-  getUserUsageSummary,
-  sanitizeUser,
-  searchUserChunks,
-  type WorkspaceStore,
-} from './lib/store.ts';
-import {
-  authenticateRequest,
-  rateLimit,
-  requireAdmin,
-  type AuthContextVariables,
-} from './middleware/auth.ts';
+import { hashPassword, signSessionToken, timingSafeEqualStrings, verifyPassword } from './lib/crypto.ts';
+import { MemoryWorkspaceRepository, type WorkspaceRepository } from './lib/repository.ts';
+import { chunkTextDocument, defaultStore, sanitizeUser, type WorkspaceStore } from './lib/store.ts';
+import { SupabaseWorkspaceRepository } from './lib/supabaseRepo.ts';
+import { authenticateRequest, requireAdmin, type AuthContextVariables } from './middleware/auth.ts';
+import { rateLimit, resolveRateLimitAdapter } from './middleware/rateLimit.ts';
 
 const ALLOWED_DOC_MIMES = new Set([
   'text/plain',
@@ -48,16 +35,17 @@ const ALLOWED_DOC_MIMES = new Set([
 
 export function createAvarestApiApp(options?: {
   store?: WorkspaceStore;
+  repoOverride?: WorkspaceRepository;
   bindingsOverride?: ServerBindings;
 }) {
-  const store = options?.store || defaultStore;
+  const localStore = options?.store || defaultStore;
+  const memoryRepo = new MemoryWorkspaceRepository(localStore);
   const app = new Hono<{ Bindings: ServerBindings; Variables: AuthContextVariables }>();
 
-  // Global request ID, config resolution, and isolation enforcement
+  // Global request ID, config resolution, isolation enforcement, and repository resolution
   app.use('*', async (c, next) => {
     const requestId = crypto.randomUUID();
     c.set('requestId', requestId);
-    c.set('store', store);
     c.header('X-Request-Id', requestId);
 
     const mergedBindings: ServerBindings = {
@@ -66,6 +54,7 @@ export function createAvarestApiApp(options?: {
     };
     const serverConfig = getServerConfig(mergedBindings);
     c.set('serverConfig', serverConfig);
+    c.set('rateLimiter', resolveRateLimitAdapter(mergedBindings));
 
     if (serverConfig.isolationErrors.length > 0) {
       return c.json(
@@ -80,10 +69,23 @@ export function createAvarestApiApp(options?: {
       );
     }
 
+    let repo: WorkspaceRepository | null = null;
+    if (options?.repoOverride) {
+      repo = options.repoOverride;
+    } else if (serverConfig.supabaseConfigured && serverConfig.supabaseUrl && serverConfig.supabaseServiceRoleKey) {
+      repo = new SupabaseWorkspaceRepository(serverConfig.supabaseUrl, serverConfig.supabaseServiceRoleKey);
+    } else if (serverConfig.environment !== 'production') {
+      repo = memoryRepo;
+    } else {
+      // Production strictly refuses silent in-memory fallback
+      repo = null;
+    }
+    c.set('repo', repo);
+
     await next();
   });
 
-  // Global safe error handler
+  // Global safe error handler (never expose raw upstream secrets or stack traces)
   app.onError((err, c) => {
     const requestId = c.get('requestId') || crypto.randomUUID();
     if (err instanceof BrainRoutingError) {
@@ -95,7 +97,7 @@ export function createAvarestApiApp(options?: {
         (err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 502) as 400 | 403 | 429 | 502 | 503,
       );
     }
-    console.error(`[Avarest API Error] ${requestId}:`, err instanceof Error ? err.message : err);
+    console.error(`[Avarest API Error] ${requestId}:`, err instanceof Error ? err.message : 'Unknown error');
     return c.json(
       { error: { code: 'INTERNAL_ERROR', message: 'An unexpected server error occurred.', requestId } },
       500,
@@ -103,24 +105,50 @@ export function createAvarestApiApp(options?: {
   });
 
   // =========================================================================
-  // PUBLIC HEALTH & SYSTEM STATUS
+  // PUBLIC HEALTH & SYSTEM STATUS (Honest DB Reachability Check)
   // =========================================================================
-  app.get('/api/v1/health', (c) => {
+  app.get('/api/v1/health', async (c) => {
     const config = c.get('serverConfig');
+    const repo = c.get('repo');
+    const rateLimiter = c.get('rateLimiter');
     const validation = validateEnvironmentIsolation({
       environment: config.environment,
       supabaseUrl: config.supabaseUrl,
       supabaseKeyPresent: Boolean(config.supabaseServiceRoleKey || config.supabaseAnonKey),
     });
 
+    const dbPing = repo
+      ? await repo.pingDatabase()
+      : { reachable: false, latencyMs: 0, error: 'Database credentials missing in production environment.' };
+
+    const storageMode =
+      repo?.kind === 'supabase'
+        ? 'supabase_postgres'
+        : repo?.kind === 'memory'
+          ? 'local_memory_sandbox'
+          : 'unconfigured_blocked';
+
+    const authMode = config.supabaseConfigured
+      ? 'supabase'
+      : config.environment === 'production'
+        ? 'unconfigured_blocked'
+        : 'local_sandbox';
+
+    const healthy = validation.valid && (config.supabaseConfigured ? dbPing.reachable : config.environment !== 'production');
+
     return c.json({
-      status: validation.valid ? 'ok' : 'degraded',
+      status: healthy ? 'ok' : 'degraded',
       environment: config.environment,
+      storageMode,
+      rateLimitMode: rateLimiter.mode,
       supabase: {
         expectedUrl: SUPABASE_PROJECTS[config.environment].url,
         configured: config.supabaseConfigured,
+        dbReachable: dbPing.reachable,
+        dbLatencyMs: dbPing.latencyMs,
+        ...(dbPing.error ? { dbError: dbPing.error } : {}),
         isolated: validation.valid,
-        authMode: config.supabaseConfigured ? 'supabase' : 'local_sandbox',
+        authMode,
         errors: validation.errors,
       },
       providers: getProviderSummary(config),
@@ -129,7 +157,7 @@ export function createAvarestApiApp(options?: {
   });
 
   // =========================================================================
-  // AUTHENTICATION (Staging Sandbox + Supabase Ready)
+  // AUTHENTICATION (Supabase Auth + Local Staging Sandbox Only)
   // =========================================================================
   const registerSchema = z.object({
     email: z.string().email().max(200),
@@ -139,26 +167,26 @@ export function createAvarestApiApp(options?: {
 
   app.post('/api/v1/auth/register', rateLimit(20, 60_000), async (c) => {
     const config = c.get('serverConfig');
+    const repo = c.get('repo');
     if (config.supabaseConfigured) {
       return c.json(
         {
           error: {
             code: 'USE_SUPABASE_CLIENT_AUTH',
-            message: 'Supabase Auth is active. Register directly via the Supabase Auth client.',
+            message: 'Supabase Auth is active. Register directly via Supabase Auth.',
             requestId: c.get('requestId'),
           },
         },
         400,
       );
     }
-    if (config.environment === 'production') {
+    if (config.environment === 'production' || !repo) {
       return c.json(
         { error: { code: 'AUTH_NOT_CONFIGURED', message: 'Production requires Supabase Auth.', requestId: c.get('requestId') } },
         503,
       );
     }
 
-    await ensureSeededSandboxAccounts(store);
     const body = await c.req.json().catch(() => null);
     const parsed = registerSchema.safeParse(body);
     if (!parsed.success) {
@@ -169,7 +197,7 @@ export function createAvarestApiApp(options?: {
     }
 
     const email = parsed.data.email.toLowerCase().trim();
-    if (store.usersByEmail.has(email)) {
+    if (await repo.getUserByEmail(email)) {
       return c.json(
         { error: { code: 'EMAIL_EXISTS', message: 'An account with this email already exists.', requestId: c.get('requestId') } },
         409,
@@ -178,32 +206,23 @@ export function createAvarestApiApp(options?: {
 
     const id = crypto.randomUUID();
     const passwordHash = await hashPassword(parsed.data.password);
-    const newUser = {
-      id,
-      email,
-      fullName: parsed.data.fullName.trim(),
-      role: 'user' as const, // Never trust client-supplied role
-      language: 'en' as const,
-      experienceMode: 'beginner' as const,
-      memoryConsent: false,
-      activePlan: 'free' as const,
-      createdAt: new Date().toISOString(),
-      passwordHash,
-    };
+    const profile = await repo.createLocalUser(
+      {
+        id,
+        email,
+        fullName: parsed.data.fullName.trim(),
+        role: 'user', // Never trust client-supplied role
+        language: 'en',
+        experienceMode: 'beginner',
+        memoryConsent: false,
+        activePlan: 'free',
+        createdAt: new Date().toISOString(),
+        passwordHash,
+      },
+      100,
+    );
 
-    store.users.set(id, newUser);
-    store.usersByEmail.set(email, id);
-    store.credits.set(id, { balance: 100, monthlyAllowance: 100 });
-    store.creditLedger.unshift({
-      id: crypto.randomUUID(),
-      userId: id,
-      delta: 100,
-      balanceAfter: 100,
-      reason: 'Initial free tier workspace credit grant',
-      referenceId: null,
-      createdAt: new Date().toISOString(),
-    });
-    appendAuditLog(store, {
+    await repo.appendAuditLog({
       actorId: id,
       action: 'auth.register',
       resourceType: 'profile',
@@ -216,7 +235,7 @@ export function createAvarestApiApp(options?: {
       config.authSessionSecret,
     );
 
-    return c.json({ token, user: sanitizeUser(newUser) }, 201);
+    return c.json({ token, user: profile }, 201);
   });
 
   const loginSchema = z.object({
@@ -226,14 +245,26 @@ export function createAvarestApiApp(options?: {
 
   app.post('/api/v1/auth/login', rateLimit(30, 60_000), async (c) => {
     const config = c.get('serverConfig');
-    if (config.environment === 'production' && !config.supabaseConfigured) {
+    const repo = c.get('repo');
+    if (config.supabaseConfigured) {
+      return c.json(
+        {
+          error: {
+            code: 'USE_SUPABASE_CLIENT_AUTH',
+            message: 'Supabase Auth is active. Sign in via Supabase Auth.',
+            requestId: c.get('requestId'),
+          },
+        },
+        400,
+      );
+    }
+    if (config.environment === 'production' || !repo) {
       return c.json(
         { error: { code: 'AUTH_NOT_CONFIGURED', message: 'Production requires Supabase Auth.', requestId: c.get('requestId') } },
         503,
       );
     }
 
-    await ensureSeededSandboxAccounts(store);
     const body = await c.req.json().catch(() => null);
     const parsed = loginSchema.safeParse(body);
     if (!parsed.success) {
@@ -244,9 +275,8 @@ export function createAvarestApiApp(options?: {
     }
 
     const email = parsed.data.email.toLowerCase().trim();
-    const userId = store.usersByEmail.get(email);
-    const stored = userId ? store.users.get(userId) : undefined;
-    if (!stored || !(await verifyPassword(parsed.data.password, stored.passwordHash))) {
+    const stored = await repo.getUserByEmail(email);
+    if (!stored || !stored.passwordHash || !(await verifyPassword(parsed.data.password, stored.passwordHash))) {
       return c.json(
         { error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password.', requestId: c.get('requestId') } },
         401,
@@ -257,7 +287,7 @@ export function createAvarestApiApp(options?: {
       { sub: stored.id, email: stored.email, role: stored.role, exp: Date.now() + 24 * 60 * 60 * 1000 },
       config.authSessionSecret,
     );
-    appendAuditLog(store, {
+    await repo.appendAuditLog({
       actorId: stored.id,
       action: 'auth.login',
       resourceType: 'session',
@@ -266,6 +296,111 @@ export function createAvarestApiApp(options?: {
     });
 
     return c.json({ token, user: sanitizeUser(stored) });
+  });
+
+  // Secure explicit First-Admin Bootstrap (only works with server-only ADMIN_BOOTSTRAP_SECRET when zero admins exist)
+  const bootstrapSchema = z.object({
+    email: z.string().email().max(200),
+    password: z.string().min(12).max(128).optional(),
+    fullName: z.string().min(1).max(100).optional(),
+  });
+
+  app.post('/api/v1/admin/bootstrap', rateLimit(5, 60_000), async (c) => {
+    const config = c.get('serverConfig');
+    const repo = c.get('repo');
+    if (!repo) {
+      return c.json({ error: { code: 'DATABASE_NOT_CONFIGURED', message: 'Database unavailable.', requestId: c.get('requestId') } }, 503);
+    }
+    if (!config.adminBootstrapSecret || config.adminBootstrapSecret.length < 16) {
+      return c.json(
+        { error: { code: 'BOOTSTRAP_DISABLED', message: 'ADMIN_BOOTSTRAP_SECRET is not configured on the server.', requestId: c.get('requestId') } },
+        403,
+      );
+    }
+
+    const providedSecret = c.req.header('x-admin-bootstrap-secret') || '';
+    if (!timingSafeEqualStrings(providedSecret, config.adminBootstrapSecret)) {
+      return c.json({ error: { code: 'FORBIDDEN', message: 'Invalid bootstrap secret.', requestId: c.get('requestId') } }, 403);
+    }
+
+    const existingAdmins = await repo.countAdmins();
+    if (existingAdmins > 0) {
+      return c.json(
+        { error: { code: 'ADMIN_ALREADY_EXISTS', message: 'Bootstrap locked: a platform administrator already exists.', requestId: c.get('requestId') } },
+        409,
+      );
+    }
+
+    const body = await c.req.json().catch(() => null);
+    const parsed = bootstrapSchema.safeParse(body);
+    if (!parsed.success) {
+      return c.json(
+        { error: { code: 'VALIDATION_ERROR', message: parsed.error.issues[0]?.message || 'Invalid bootstrap payload.', requestId: c.get('requestId') } },
+        400,
+      );
+    }
+
+    const email = parsed.data.email.toLowerCase().trim();
+    const existingUser = await repo.getUserByEmail(email);
+
+    if (existingUser) {
+      const promoted = await repo.updateUserRole(existingUser.id, 'super_admin');
+      await repo.appendAuditLog({
+        actorId: existingUser.id,
+        action: 'admin.bootstrap.promote',
+        resourceType: 'profile',
+        resourceId: existingUser.id,
+        detail: `Bootstrapped initial super_admin for ${email}`,
+      });
+      return c.json({ user: promoted }, 200);
+    }
+
+    if (config.supabaseConfigured) {
+      return c.json(
+        {
+          error: {
+            code: 'USER_NOT_FOUND',
+            message: 'Register the user via Supabase Auth first, then invoke bootstrap with their email to promote.',
+            requestId: c.get('requestId'),
+          },
+        },
+        404,
+      );
+    }
+
+    if (!parsed.data.password) {
+      return c.json(
+        { error: { code: 'VALIDATION_ERROR', message: 'Password (min 12 chars) required to create initial sandbox admin.', requestId: c.get('requestId') } },
+        400,
+      );
+    }
+
+    const id = crypto.randomUUID();
+    const passwordHash = await hashPassword(parsed.data.password);
+    const created = await repo.createLocalUser(
+      {
+        id,
+        email,
+        fullName: parsed.data.fullName?.trim() || 'Platform Administrator',
+        role: 'super_admin',
+        language: 'en',
+        experienceMode: 'advanced',
+        memoryConsent: false,
+        activePlan: 'enterprise',
+        createdAt: new Date().toISOString(),
+        passwordHash,
+      },
+      1000,
+    );
+    await repo.appendAuditLog({
+      actorId: id,
+      action: 'admin.bootstrap.create',
+      resourceType: 'profile',
+      resourceId: id,
+      detail: `Created initial super_admin ${email}`,
+    });
+
+    return c.json({ user: created }, 201);
   });
 
   // =========================================================================
@@ -304,6 +439,7 @@ export function createAvarestApiApp(options?: {
 
   app.patch('/api/v1/auth/profile', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = profilePatchSchema.safeParse(body);
     if (!parsed.success) {
@@ -313,17 +449,12 @@ export function createAvarestApiApp(options?: {
       );
     }
 
-    const stored = store.users.get(user.id);
-    if (!stored) {
+    const updated = await repo.updateProfile(user.id, parsed.data);
+    if (!updated) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Profile not found.' } }, 404);
     }
 
-    if (parsed.data.fullName !== undefined) stored.fullName = parsed.data.fullName.trim();
-    if (parsed.data.language !== undefined) stored.language = parsed.data.language;
-    if (parsed.data.experienceMode !== undefined) stored.experienceMode = parsed.data.experienceMode;
-    if (parsed.data.memoryConsent !== undefined) stored.memoryConsent = parsed.data.memoryConsent;
-
-    return c.json({ user: sanitizeUser(stored) });
+    return c.json({ user: updated });
   });
 
   app.get('/api/v1/models', (c) => {
@@ -334,11 +465,10 @@ export function createAvarestApiApp(options?: {
   // =========================================================================
   // PROJECTS CRUD (Strictly Tenant/User Isolated)
   // =========================================================================
-  app.get('/api/v1/projects', (c) => {
+  app.get('/api/v1/projects', async (c) => {
     const user = c.get('currentUser');
-    const items = Array.from(store.projects.values())
-      .filter((p) => p.userId === user.id)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const repo = c.get('repo')!;
+    const items = await repo.listProjects(user.id);
     return c.json({ projects: items });
   });
 
@@ -350,133 +480,110 @@ export function createAvarestApiApp(options?: {
 
   app.post('/api/v1/projects', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = projectSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Project name is required.' } }, 400);
     }
-    const now = new Date().toISOString();
-    const project: Project = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      name: parsed.data.name.trim(),
-      description: parsed.data.description?.trim() || '',
-      instructions: parsed.data.instructions?.trim() || '',
-      archived: false,
-      createdAt: now,
-      updatedAt: now,
-    };
-    store.projects.set(project.id, project);
+    const project = await repo.createProject(user.id, {
+      name: parsed.data.name,
+      description: parsed.data.description || '',
+      instructions: parsed.data.instructions || '',
+    });
     return c.json({ project }, 201);
   });
 
   app.patch('/api/v1/projects/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const existing = store.projects.get(id);
-    if (!existing || existing.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const updated = await repo.updateProject(user.id, id, body);
+    if (!updated) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Project not found.' } }, 404);
     }
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.name === 'string' && body.name.trim()) existing.name = body.name.trim();
-    if (typeof body.description === 'string') existing.description = body.description.trim();
-    if (typeof body.instructions === 'string') existing.instructions = body.instructions.trim();
-    if (typeof body.archived === 'boolean') existing.archived = body.archived;
-    existing.updatedAt = new Date().toISOString();
-    return c.json({ project: existing });
+    return c.json({ project: updated });
   });
 
-  app.delete('/api/v1/projects/:id', (c) => {
+  app.delete('/api/v1/projects/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const existing = store.projects.get(id);
-    if (!existing || existing.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const deleted = await repo.deleteProject(user.id, id);
+    if (!deleted) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Project not found.' } }, 404);
     }
-    store.projects.delete(id);
     return c.json({ deleted: true });
   });
 
   // =========================================================================
   // CONVERSATIONS CRUD (Strictly Owned by Current User)
   // =========================================================================
-  app.get('/api/v1/conversations', (c) => {
+  app.get('/api/v1/conversations', async (c) => {
     const user = c.get('currentUser');
-    const q = (c.req.query('q') || '').toLowerCase().trim();
-    const items = Array.from(store.conversations.values())
-      .filter((conv) => conv.userId === user.id && (!q || conv.title.toLowerCase().includes(q)))
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    return c.json({ conversations: items });
+    const repo = c.get('repo')!;
+    const q = c.req.query('q') || '';
+    const conversations = await repo.listConversations(user.id, q);
+    return c.json({ conversations });
   });
 
   app.post('/api/v1/conversations', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => ({}));
-    const now = new Date().toISOString();
-    const projectId = typeof body.projectId === 'string' ? body.projectId : null;
+    const projectId = typeof body.projectId === 'string' && body.projectId ? body.projectId : null;
     if (projectId) {
-      const proj = store.projects.get(projectId);
-      if (!proj || proj.userId !== user.id) {
+      const proj = await repo.getProject(user.id, projectId);
+      if (!proj) {
         return c.json({ error: { code: 'NOT_FOUND', message: 'Associated project not found.' } }, 404);
       }
     }
-    const conv: Conversation = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      projectId,
+    const conversation = await repo.createConversation(user.id, {
       title: typeof body.title === 'string' && body.title.trim() ? body.title.trim().slice(0, 120) : 'New Conversation',
+      projectId,
       routingMode: body.routingMode === 'manual' ? 'manual' : 'auto',
       preferredModel: typeof body.preferredModel === 'string' ? body.preferredModel : null,
-      archived: false,
-      createdAt: now,
-      updatedAt: now,
-    };
-    store.conversations.set(conv.id, conv);
-    store.messages.set(conv.id, []);
-    return c.json({ conversation: conv }, 201);
+    });
+    return c.json({ conversation }, 201);
   });
 
-  app.get('/api/v1/conversations/:id', (c) => {
+  app.get('/api/v1/conversations/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const conv = store.conversations.get(id);
-    if (!conv || conv.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const conversation = await repo.getConversation(user.id, id);
+    if (!conversation) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Conversation not found.' } }, 404);
     }
-    const msgs = store.messages.get(id) || [];
-    return c.json({ conversation: { ...conv, messages: msgs } });
+    return c.json({ conversation });
   });
 
   app.patch('/api/v1/conversations/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const conv = store.conversations.get(id);
-    if (!conv || conv.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const conversation = await repo.updateConversation(user.id, id, body);
+    if (!conversation) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Conversation not found.' } }, 404);
     }
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.title === 'string' && body.title.trim()) conv.title = body.title.trim().slice(0, 120);
-    if (typeof body.archived === 'boolean') conv.archived = body.archived;
-    if (body.routingMode === 'auto' || body.routingMode === 'manual') conv.routingMode = body.routingMode;
-    if (body.preferredModel === null || typeof body.preferredModel === 'string') conv.preferredModel = body.preferredModel;
-    conv.updatedAt = new Date().toISOString();
-    return c.json({ conversation: conv });
+    return c.json({ conversation });
   });
 
-  app.delete('/api/v1/conversations/:id', (c) => {
+  app.delete('/api/v1/conversations/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const conv = store.conversations.get(id);
-    if (!conv || conv.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const deleted = await repo.deleteConversation(user.id, id);
+    if (!deleted) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Conversation not found.' } }, 404);
     }
-    store.conversations.delete(id);
-    store.messages.delete(id);
     return c.json({ deleted: true });
   });
 
   // =========================================================================
-  // AVAREST BRAIN CHAT EXECUTION (With Streaming & Persistence)
+  // AVAREST BRAIN CHAT EXECUTION (Native Streaming & Atomic Credit Deduction)
   // =========================================================================
   const chatSchema = z.object({
     conversationId: z.string().optional(),
@@ -498,6 +605,7 @@ export function createAvarestApiApp(options?: {
   app.post('/api/v1/chat', rateLimit(40, 60_000), async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = chatSchema.safeParse(body);
     if (!parsed.success) {
@@ -515,43 +623,39 @@ export function createAvarestApiApp(options?: {
       );
     }
 
-    const acct = store.credits.get(user.id) || { balance: 0, monthlyAllowance: 100 };
-    if (acct.balance < 0.5) {
+    const currentBalance = await repo.getCreditBalance(user.id);
+    if (currentBalance < 0.1) {
       return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
     }
 
     // Ensure or create conversation owned by current user
-    let conv: Conversation | undefined;
+    let conv: Conversation | null = null;
+    let existingMessages: ChatMessage[] = [];
     if (parsed.data.conversationId) {
-      conv = store.conversations.get(parsed.data.conversationId);
-      if (!conv || conv.userId !== user.id) {
+      const loaded = await repo.getConversation(user.id, parsed.data.conversationId);
+      if (!loaded) {
         return c.json({ error: { code: 'NOT_FOUND', message: 'Conversation not found.' } }, 404);
       }
+      conv = loaded;
+      existingMessages = loaded.messages;
     } else {
-      const now = new Date().toISOString();
-      conv = {
-        id: crypto.randomUUID(),
-        userId: user.id,
-        projectId: parsed.data.projectId || null,
+      conv = await repo.createConversation(user.id, {
         title: prompt.slice(0, 60) + (prompt.length > 60 ? '...' : ''),
+        projectId: parsed.data.projectId || null,
         routingMode,
         preferredModel: modelId || null,
-        archived: false,
-        createdAt: now,
-        updatedAt: now,
-      };
-      store.conversations.set(conv.id, conv);
-      store.messages.set(conv.id, []);
+      });
     }
 
     // Route via Avarest Brain
+    const policies = await repo.listRoutingPolicies();
     const decision = routeWithAvarestBrain({
       prompt,
       config,
       mode: routingMode,
       requestedModelId: modelId,
       userPlan: user.activePlan,
-      policies: store.routingPolicies,
+      policies,
     });
 
     // Build context: system instructions + project instructions + optional RAG + consent-based memories
@@ -559,13 +663,13 @@ export function createAvarestApiApp(options?: {
       'You are Avarest One, an AI workspace powered by Avarest Brain. Respond accurately, clearly, and concisely.',
     ];
     if (conv.projectId) {
-      const proj = store.projects.get(conv.projectId);
-      if (proj && proj.userId === user.id && proj.instructions) {
+      const proj = await repo.getProject(user.id, conv.projectId);
+      if (proj && proj.instructions) {
         systemParts.push(`Project instructions (${proj.name}):\n${proj.instructions}`);
       }
     }
     if (user.memoryConsent) {
-      const userMems = store.memories.get(user.id) || [];
+      const userMems = await repo.listMemories(user.id);
       if (userMems.length > 0) {
         systemParts.push(
           `Authorized user memory context:\n${userMems.slice(0, 10).map((m) => `- ${m.fact}`).join('\n')}`,
@@ -573,7 +677,7 @@ export function createAvarestApiApp(options?: {
       }
     }
     if (useKnowledge) {
-      const matches = searchUserChunks(store, user.id, prompt, 3);
+      const matches = await repo.searchKnowledgeChunks(user.id, prompt, 3);
       if (matches.length > 0) {
         systemParts.push(
           `Retrieved workspace knowledge:\n${matches.map((m) => `[${m.fileName}#${m.chunkIndex}]: ${m.content}`).join('\n\n')}`,
@@ -585,7 +689,6 @@ export function createAvarestApiApp(options?: {
       ? `${prompt}\n\n[Attached file: ${attachment.fileName}]\n${attachment.content}`
       : prompt;
 
-    const history = store.messages.get(conv.id) || [];
     const userMsg: ChatMessage = {
       id: crypto.randomUUID(),
       conversationId: conv.id,
@@ -596,11 +699,13 @@ export function createAvarestApiApp(options?: {
       citations: [],
       createdAt: new Date().toISOString(),
     };
-    history.push(userMsg);
-    store.messages.set(conv.id, history);
+    await repo.addMessage(user.id, userMsg);
 
-    const providerMessages = history.slice(-14).map((m) => ({ role: m.role, content: m.content }));
+    const providerMessages = [...existingMessages, userMsg]
+      .slice(-14)
+      .map((m) => ({ role: m.role, content: m.content }));
     const startedAt = Date.now();
+    const assistantMsgId = crypto.randomUUID();
 
     if (stream) {
       const encoder = new TextEncoder();
@@ -638,7 +743,7 @@ export function createAvarestApiApp(options?: {
             const inputTokens = finalResult?.inputTokens || 0;
             const outputTokens = finalResult?.outputTokens || 0;
             const assistantMsg: ChatMessage = {
-              id: crypto.randomUUID(),
+              id: assistantMsgId,
               conversationId,
               role: 'assistant',
               content: text,
@@ -648,21 +753,20 @@ export function createAvarestApiApp(options?: {
               routingReason: decision.reason,
               inputTokens,
               outputTokens,
+              usageIsEstimated: finalResult?.usageIsEstimated ?? true,
               citations: finalResult?.citations || [],
               createdAt: new Date().toISOString(),
             };
-            history.push(assistantMsg);
-            conv!.updatedAt = new Date().toISOString();
+            await repo.addMessage(user.id, assistantMsg);
 
             const creditCost = Number(Math.max(0.1, (inputTokens + outputTokens) / 1000).toFixed(4));
-            deductCreditsAtomic(store, {
+            await repo.deductCredits({
               userId: user.id,
               amount: creditCost,
               reason: `Chat (${decision.selectedModel})`,
               referenceId: assistantMsg.id,
             });
-            store.usageRecords.push({
-              id: crypto.randomUUID(),
+            await repo.recordUsage({
               userId: user.id,
               providerId: decision.selectedProvider,
               modelId: decision.selectedModel,
@@ -670,9 +774,8 @@ export function createAvarestApiApp(options?: {
               inputTokens,
               outputTokens,
               creditsCharged: creditCost,
-              createdAt: new Date().toISOString(),
             });
-            store.routingLogs.unshift({
+            await repo.addRoutingLog({
               id: crypto.randomUUID(),
               userId: user.id,
               taskCategory: decision.taskCategory,
@@ -689,7 +792,7 @@ export function createAvarestApiApp(options?: {
             controller.close();
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Streaming failed';
-            store.routingLogs.unshift({
+            await repo.addRoutingLog({
               id: crypto.randomUUID(),
               userId: user.id,
               taskCategory: decision.taskCategory,
@@ -726,7 +829,7 @@ export function createAvarestApiApp(options?: {
     });
 
     const assistantMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: assistantMsgId,
       conversationId: conv.id,
       role: 'assistant',
       content: completion.text,
@@ -736,21 +839,20 @@ export function createAvarestApiApp(options?: {
       routingReason: decision.reason,
       inputTokens: completion.inputTokens,
       outputTokens: completion.outputTokens,
+      usageIsEstimated: completion.usageIsEstimated,
       citations: completion.citations,
       createdAt: new Date().toISOString(),
     };
-    history.push(assistantMsg);
-    conv.updatedAt = new Date().toISOString();
+    await repo.addMessage(user.id, assistantMsg);
 
     const creditCost = Number(Math.max(0.1, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    deductCreditsAtomic(store, {
+    await repo.deductCredits({
       userId: user.id,
       amount: creditCost,
       reason: `Chat (${decision.selectedModel})`,
       referenceId: assistantMsg.id,
     });
-    store.usageRecords.push({
-      id: crypto.randomUUID(),
+    await repo.recordUsage({
       userId: user.id,
       providerId: decision.selectedProvider,
       modelId: decision.selectedModel,
@@ -758,9 +860,8 @@ export function createAvarestApiApp(options?: {
       inputTokens: completion.inputTokens,
       outputTokens: completion.outputTokens,
       creditsCharged: creditCost,
-      createdAt: new Date().toISOString(),
     });
-    store.routingLogs.unshift({
+    await repo.addRoutingLog({
       id: crypto.randomUUID(),
       userId: user.id,
       taskCategory: decision.taskCategory,
@@ -785,14 +886,17 @@ export function createAvarestApiApp(options?: {
   // =========================================================================
   // AVAREST BRAIN LOGS & POLICIES
   // =========================================================================
-  app.get('/api/v1/brain/logs', (c) => {
+  app.get('/api/v1/brain/logs', async (c) => {
     const user = c.get('currentUser');
-    const logs = store.routingLogs.filter((l) => l.userId === user.id).slice(0, 50);
+    const repo = c.get('repo')!;
+    const logs = await repo.listRoutingLogs(user.id, 50);
     return c.json({ logs });
   });
 
-  app.get('/api/v1/brain/policies', (c) => {
-    return c.json({ policies: store.routingPolicies });
+  app.get('/api/v1/brain/policies', async (c) => {
+    const repo = c.get('repo')!;
+    const policies = await repo.listRoutingPolicies();
+    return c.json({ policies });
   });
 
   // =========================================================================
@@ -802,30 +906,31 @@ export function createAvarestApiApp(options?: {
     query: z.string().min(3).max(2000),
   });
 
-  app.get('/api/v1/research', (c) => {
+  app.get('/api/v1/research', async (c) => {
     const user = c.get('currentUser');
-    const reports = Array.from(store.researchReports.values())
-      .filter((r) => r.userId === user.id)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const repo = c.get('repo')!;
+    const reports = await repo.listResearchReports(user.id);
     return c.json({ reports });
   });
 
   app.post('/api/v1/research', rateLimit(15, 60_000), async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = researchSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Research query must be at least 3 characters.' } }, 400);
     }
 
+    const policies = await repo.listRoutingPolicies();
     const decision = routeWithAvarestBrain({
       prompt: parsed.data.query,
       config,
       mode: 'auto',
       explicitTask: 'research',
       userPlan: user.activePlan,
-      policies: store.routingPolicies,
+      policies,
     });
 
     const completion = await executeProviderCompletion({
@@ -849,14 +954,23 @@ export function createAvarestApiApp(options?: {
       groundingActive: completion.groundingActive,
       createdAt: new Date().toISOString(),
     };
-    store.researchReports.set(report.id, report);
+    await repo.createResearchReport(report);
 
     const cost = Number(Math.max(0.25, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    deductCreditsAtomic(store, {
+    await repo.deductCredits({
       userId: user.id,
       amount: cost,
       reason: `Deep Research (${decision.selectedModel})`,
       referenceId: report.id,
+    });
+    await repo.recordUsage({
+      userId: user.id,
+      providerId: decision.selectedProvider,
+      modelId: decision.selectedModel,
+      feature: 'research',
+      inputTokens: completion.inputTokens,
+      outputTokens: completion.outputTokens,
+      creditsCharged: cost,
     });
 
     return c.json({ report }, 201);
@@ -875,19 +989,21 @@ export function createAvarestApiApp(options?: {
   app.post('/api/v1/coder', rateLimit(25, 60_000), async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = coderSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid AI Coder request.' } }, 400);
     }
 
+    const policies = await repo.listRoutingPolicies();
     const decision = routeWithAvarestBrain({
       prompt: parsed.data.prompt,
       config,
       mode: 'auto',
       explicitTask: 'coding',
       userPlan: user.activePlan,
-      policies: store.routingPolicies,
+      policies,
     });
 
     const composedPrompt = [
@@ -906,27 +1022,43 @@ export function createAvarestApiApp(options?: {
       config,
     });
 
+    const coderRefId = crypto.randomUUID();
     const cost = Number(Math.max(0.2, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    deductCreditsAtomic(store, {
+    await repo.deductCredits({
       userId: user.id,
       amount: cost,
       reason: `AI Coder: ${parsed.data.taskType}`,
+      referenceId: coderRefId,
+    });
+    await repo.recordUsage({
+      userId: user.id,
+      providerId: decision.selectedProvider,
+      modelId: decision.selectedModel,
+      feature: 'coder',
+      inputTokens: completion.inputTokens,
+      outputTokens: completion.outputTokens,
+      creditsCharged: cost,
     });
 
     return c.json({
       output: completion.text,
       decision,
       requiresHumanApprovalForExternalWrite: true,
-      tokens: { input: completion.inputTokens, output: completion.outputTokens },
+      tokens: {
+        input: completion.inputTokens,
+        output: completion.outputTokens,
+        usageIsEstimated: completion.usageIsEstimated,
+      },
     });
   });
 
   // =========================================================================
   // AI AGENTS & HUMAN APPROVAL CHECKPOINTS
   // =========================================================================
-  app.get('/api/v1/agents', (c) => {
+  app.get('/api/v1/agents', async (c) => {
     const user = c.get('currentUser');
-    const agents = Array.from(store.agents.values()).filter((a) => a.userId === user.id);
+    const repo = c.get('repo')!;
+    const agents = await repo.listAgents(user.id);
     return c.json({ agents });
   });
 
@@ -941,6 +1073,7 @@ export function createAvarestApiApp(options?: {
 
   app.post('/api/v1/agents', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = agentSchema.safeParse(body);
     if (!parsed.success) {
@@ -953,30 +1086,24 @@ export function createAvarestApiApp(options?: {
       ...parsed.data,
       createdAt: new Date().toISOString(),
     };
-    store.agents.set(agent.id, agent);
+    await repo.createAgent(agent);
     return c.json({ agent }, 201);
   });
 
-  app.get('/api/v1/agents/runs', (c) => {
+  app.get('/api/v1/agents/runs', async (c) => {
     const user = c.get('currentUser');
-    const runs = Array.from(store.agentRuns.values())
-      .filter((r) => r.userId === user.id)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .map((run) => {
-        const pendingApproval = Array.from(store.agentApprovals.values()).find(
-          (ap) => ap.runId === run.id && ap.decision === 'pending',
-        );
-        return { ...run, pendingApproval: pendingApproval || null };
-      });
+    const repo = c.get('repo')!;
+    const runs = await repo.listAgentRuns(user.id);
     return c.json({ runs });
   });
 
   app.post('/api/v1/agents/:id/run', rateLimit(15, 60_000), async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
+    const repo = c.get('repo')!;
     const agentId = c.req.param('id') || '';
-    const agent = store.agents.get(agentId);
-    if (!agent || agent.userId !== user.id) {
+    const agent = await repo.getAgent(user.id, agentId);
+    if (!agent) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Agent not found.' } }, 404);
     }
 
@@ -999,6 +1126,7 @@ export function createAvarestApiApp(options?: {
       createdAt: now,
       updatedAt: now,
     };
+    await repo.createAgentRun(run);
 
     if (agent.requireApproval) {
       const approval: AgentApproval = {
@@ -1011,8 +1139,7 @@ export function createAvarestApiApp(options?: {
         decidedAt: null,
         createdAt: now,
       };
-      store.agentApprovals.set(approval.id, approval);
-      store.agentRuns.set(run.id, run);
+      await repo.createApproval(approval);
       return c.json({ run: { ...run, pendingApproval: approval } }, 201);
     }
 
@@ -1037,16 +1164,17 @@ export function createAvarestApiApp(options?: {
       run.status = 'failed';
       run.errorMessage = err instanceof Error ? err.message : 'Agent execution failed';
     }
-    run.updatedAt = new Date().toISOString();
-    store.agentRuns.set(run.id, run);
-    return c.json({ run }, 201);
+    const updated = await repo.updateAgentRun(run.id, { status: run.status, outputSummary: run.outputSummary, errorMessage: run.errorMessage });
+    return c.json({ run: updated || run }, 201);
   });
 
   app.post('/api/v1/agents/approvals/:id/decide', async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
-    const approval = store.agentApprovals.get(c.req.param('id'));
-    if (!approval || approval.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const approvalId = c.req.param('id') || '';
+    const approval = await repo.getApproval(user.id, approvalId);
+    if (!approval) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Approval checkpoint not found.' } }, 404);
     }
     if (approval.decision !== 'pending') {
@@ -1058,22 +1186,24 @@ export function createAvarestApiApp(options?: {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Decision must be "approved" or "rejected".' } }, 400);
     }
 
-    approval.decision = body.decision;
-    approval.decidedAt = new Date().toISOString();
-
-    const run = store.agentRuns.get(approval.runId);
+    const resolvedApproval = await repo.resolveApproval(approval.id, body.decision);
+    const run = await repo.getAgentRun(user.id, approval.runId);
     if (!run) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Associated run not found.' } }, 404);
     }
 
     if (body.decision === 'rejected') {
-      run.status = 'canceled';
-      run.outputSummary = 'Execution canceled at human approval checkpoint.';
-      run.updatedAt = new Date().toISOString();
-      return c.json({ approval, run });
+      const updated = await repo.updateAgentRun(run.id, {
+        status: 'canceled',
+        outputSummary: 'Execution canceled at human approval checkpoint.',
+      });
+      return c.json({ approval: resolvedApproval, run: updated || run });
     }
 
-    const agent = store.agents.get(run.agentId);
+    const agent = await repo.getAgent(user.id, run.agentId);
+    let nextStatus: AgentRun['status'] = 'completed';
+    let outputSummary: string | null = null;
+    let errorMessage: string | null = null;
     try {
       const decision = routeWithAvarestBrain({
         prompt: run.inputTask,
@@ -1088,33 +1218,34 @@ export function createAvarestApiApp(options?: {
         messages: [{ role: 'user', content: run.inputTask }],
         config,
       });
-      run.status = 'completed';
-      run.outputSummary = res.text;
+      outputSummary = res.text;
     } catch (err) {
-      run.status = 'failed';
-      run.errorMessage = err instanceof Error ? err.message : 'Agent execution failed';
+      nextStatus = 'failed';
+      errorMessage = err instanceof Error ? err.message : 'Agent execution failed';
     }
-    run.updatedAt = new Date().toISOString();
-    return c.json({ approval, run });
+    const updatedRun = await repo.updateAgentRun(run.id, { status: nextStatus, outputSummary, errorMessage });
+    return c.json({ approval: resolvedApproval, run: updatedRun || run });
   });
 
-  app.post('/api/v1/agents/runs/:id/cancel', (c) => {
+  app.post('/api/v1/agents/runs/:id/cancel', async (c) => {
     const user = c.get('currentUser');
-    const run = store.agentRuns.get(c.req.param('id'));
-    if (!run || run.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const runId = c.req.param('id') || '';
+    const existing = await repo.getAgentRun(user.id, runId);
+    if (!existing) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Run not found.' } }, 404);
     }
-    run.status = 'canceled';
-    run.updatedAt = new Date().toISOString();
+    const run = await repo.updateAgentRun(runId, { status: 'canceled' });
     return c.json({ run });
   });
 
   // =========================================================================
   // KNOWLEDGE & CONSENT-BASED MEMORY
   // =========================================================================
-  app.get('/api/v1/knowledge/documents', (c) => {
+  app.get('/api/v1/knowledge/documents', async (c) => {
     const user = c.get('currentUser');
-    const documents = Array.from(store.knowledgeDocs.values()).filter((d) => d.userId === user.id);
+    const repo = c.get('repo')!;
+    const documents = await repo.listKnowledgeDocs(user.id);
     return c.json({ documents });
   });
 
@@ -1126,6 +1257,7 @@ export function createAvarestApiApp(options?: {
 
   app.post('/api/v1/knowledge/documents', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => null);
     const parsed = docUploadSchema.safeParse(body);
     if (!parsed.success) {
@@ -1137,63 +1269,53 @@ export function createAvarestApiApp(options?: {
         400,
       );
     }
-
     const chunks = chunkTextDocument(parsed.data.content);
-    const docId = crypto.randomUUID();
-    const doc: KnowledgeDocument = {
-      id: docId,
-      userId: user.id,
-      fileName: parsed.data.fileName.trim(),
-      mimeType: parsed.data.mimeType,
-      byteSize: new TextEncoder().encode(parsed.data.content).length,
-      chunkCount: chunks.length,
-      createdAt: new Date().toISOString(),
-    };
-    store.knowledgeDocs.set(docId, doc);
-    chunks.forEach((content, idx) => {
-      store.knowledgeChunks.push({
-        id: crypto.randomUUID(),
-        documentId: docId,
-        userId: user.id,
-        fileName: doc.fileName,
-        chunkIndex: idx,
-        content,
-      });
-    });
+    if (chunks.length === 0) {
+      return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Document text cannot be empty.' } }, 400);
+    }
 
+    const doc = await repo.uploadKnowledgeDoc({
+      userId: user.id,
+      fileName: parsed.data.fileName,
+      mimeType: parsed.data.mimeType,
+      content: parsed.data.content,
+    });
     return c.json({ document: doc }, 201);
   });
 
-  app.delete('/api/v1/knowledge/documents/:id', (c) => {
+  app.delete('/api/v1/knowledge/documents/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const doc = store.knowledgeDocs.get(id);
-    if (!doc || doc.userId !== user.id) {
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const deleted = await repo.deleteKnowledgeDoc(user.id, id);
+    if (!deleted) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Document not found.' } }, 404);
     }
-    store.knowledgeDocs.delete(id);
-    store.knowledgeChunks = store.knowledgeChunks.filter((ch) => ch.documentId !== id);
     return c.json({ deleted: true });
   });
 
   app.post('/api/v1/knowledge/search', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     const body = await c.req.json().catch(() => ({}));
     const query = typeof body.query === 'string' ? body.query.trim() : '';
-    const matches = searchUserChunks(store, user.id, query, 8);
-    return c.json({ matches });
+    const matches = await repo.searchKnowledgeChunks(user.id, query, 8);
+    return c.json({ matches, retrievalMode: 'keyword_rank' });
   });
 
-  app.get('/api/v1/memories', (c) => {
+  app.get('/api/v1/memories', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
+    const memories = await repo.listMemories(user.id);
     return c.json({
       consentEnabled: user.memoryConsent,
-      memories: store.memories.get(user.id) || [],
+      memories,
     });
   });
 
   app.post('/api/v1/memories', async (c) => {
     const user = c.get('currentUser');
+    const repo = c.get('repo')!;
     if (!user.memoryConsent) {
       return c.json(
         { error: { code: 'CONSENT_REQUIRED', message: 'Enable memory consent in settings before saving personal memories.' } },
@@ -1205,27 +1327,15 @@ export function createAvarestApiApp(options?: {
     if (fact.length < 3 || fact.length > 500) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Memory fact must be 3–500 characters.' } }, 400);
     }
-    const existing = store.memories.get(user.id) || [];
-    const memory = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      fact,
-      source: 'user' as const,
-      createdAt: new Date().toISOString(),
-    };
-    existing.unshift(memory);
-    store.memories.set(user.id, existing);
+    const memory = await repo.addMemory(user.id, fact);
     return c.json({ memory }, 201);
   });
 
-  app.delete('/api/v1/memories/:id', (c) => {
+  app.delete('/api/v1/memories/:id', async (c) => {
     const user = c.get('currentUser');
-    const id = c.req.param('id');
-    const existing = store.memories.get(user.id) || [];
-    store.memories.set(
-      user.id,
-      existing.filter((m) => m.id !== id),
-    );
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    await repo.deleteMemory(user.id, id);
     return c.json({ deleted: true });
   });
 
@@ -1295,83 +1405,95 @@ export function createAvarestApiApp(options?: {
   // =========================================================================
   // USAGE & BILLING LEDGER
   // =========================================================================
-  app.get('/api/v1/usage', (c) => {
+  app.get('/api/v1/usage', async (c) => {
     const user = c.get('currentUser');
-    return c.json({ usage: getUserUsageSummary(store, user.id) });
+    const repo = c.get('repo')!;
+    const usage = await repo.getUserUsageSummary(user.id);
+    return c.json({ usage });
   });
 
   // =========================================================================
   // PROTECTED ADMIN CONSOLE (Strict Server-Side RBAC)
   // =========================================================================
-  app.use('/api/v1/admin/*', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/overview', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/provider-health', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/users*', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/audit-logs', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/flags*', authenticateRequest, requireAdmin);
+  app.use('/api/v1/admin/policies*', authenticateRequest, requireAdmin);
 
-  app.get('/api/v1/admin/overview', (c) => {
+  app.get('/api/v1/admin/overview', async (c) => {
     const config = c.get('serverConfig');
+    const repo = c.get('repo')!;
+    const counts = await repo.getAdminOverview();
     return c.json({
       environment: config.environment,
-      totalUsers: store.users.size,
-      totalConversations: store.conversations.size,
-      totalProjects: store.projects.size,
-      totalAgents: store.agents.size,
-      totalRoutingLogs: store.routingLogs.length,
-      totalUsageRecords: store.usageRecords.length,
+      ...counts,
       providers: getProviderSummary(config),
     });
   });
 
-  app.get('/api/v1/admin/users', (c) => {
-    const users = Array.from(store.users.values()).map((u) => {
-      const acct = store.credits.get(u.id);
-      return {
-        ...sanitizeUser(u),
-        creditBalance: acct?.balance ?? 0,
-      };
-    });
+  app.get('/api/v1/admin/provider-health', async (c) => {
+    const config = c.get('serverConfig');
+    const results = await Promise.all(
+      ACTIVE_PROVIDER_IDS.map((pid) => probeProviderConnectivity(pid, config)),
+    );
+    return c.json({ providers: results });
+  });
+
+  app.get('/api/v1/admin/users', async (c) => {
+    const repo = c.get('repo')!;
+    const users = await repo.listUsersWithCredits();
     return c.json({ users });
   });
 
   app.patch('/api/v1/admin/users/:id/role', async (c) => {
     const actor = c.get('currentUser');
-    const target = store.users.get(c.req.param('id'));
-    if (!target) {
-      return c.json({ error: { code: 'NOT_FOUND', message: 'User not found.' } }, 404);
-    }
+    const repo = c.get('repo')!;
+    const targetId = c.req.param('id') || '';
     const body = await c.req.json().catch(() => ({}));
     if (body.role !== 'user' && body.role !== 'admin' && body.role !== 'super_admin') {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid role.' } }, 400);
     }
-    target.role = body.role;
-    appendAuditLog(store, {
+    const updated = await repo.updateUserRole(targetId, body.role);
+    if (!updated) {
+      return c.json({ error: { code: 'NOT_FOUND', message: 'User not found.' } }, 404);
+    }
+    await repo.appendAuditLog({
       actorId: actor.id,
       action: 'admin.user.role_updated',
       resourceType: 'profile',
-      resourceId: target.id,
-      detail: `Role changed to ${body.role} for ${target.email}`,
+      resourceId: updated.id,
+      detail: `Role changed to ${body.role} for ${updated.email}`,
     });
-    return c.json({ user: sanitizeUser(target) });
+    return c.json({ user: updated });
   });
 
-  app.get('/api/v1/admin/audit-logs', (c) => {
-    return c.json({ auditLogs: store.auditLogs.slice(0, 100) });
+  app.get('/api/v1/admin/audit-logs', async (c) => {
+    const repo = c.get('repo')!;
+    const auditLogs = await repo.listAuditLogs(100);
+    return c.json({ auditLogs });
   });
 
-  app.get('/api/v1/admin/flags', (c) => {
-    return c.json({ flags: Array.from(store.featureFlags.values()) });
+  app.get('/api/v1/admin/flags', async (c) => {
+    const repo = c.get('repo')!;
+    const flags = await repo.listFeatureFlags();
+    return c.json({ flags });
   });
 
   app.patch('/api/v1/admin/flags/:key', async (c) => {
     const actor = c.get('currentUser');
-    const key = c.req.param('key');
-    const flag = store.featureFlags.get(key);
-    if (!flag) {
-      return c.json({ error: { code: 'NOT_FOUND', message: 'Feature flag not found.' } }, 404);
-    }
+    const repo = c.get('repo')!;
+    const key = c.req.param('key') || '';
     const body = await c.req.json().catch(() => ({}));
     if (typeof body.enabled !== 'boolean') {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'enabled boolean is required.' } }, 400);
     }
-    flag.enabled = body.enabled;
-    appendAuditLog(store, {
+    const flag = await repo.toggleFeatureFlag(key, body.enabled);
+    if (!flag) {
+      return c.json({ error: { code: 'NOT_FOUND', message: 'Feature flag not found.' } }, 404);
+    }
+    await repo.appendAuditLog({
       actorId: actor.id,
       action: 'admin.flag.updated',
       resourceType: 'feature_flag',
@@ -1383,16 +1505,14 @@ export function createAvarestApiApp(options?: {
 
   app.patch('/api/v1/admin/policies/:id', async (c) => {
     const actor = c.get('currentUser');
-    const id = c.req.param('id');
-    const policy = store.routingPolicies.find((p) => p.id === id);
+    const repo = c.get('repo')!;
+    const id = c.req.param('id') || '';
+    const body = await c.req.json().catch(() => ({}));
+    const policy = await repo.updateRoutingPolicy(id, body);
     if (!policy) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Routing policy not found.' } }, 404);
     }
-    const body = await c.req.json().catch(() => ({}));
-    if (typeof body.active === 'boolean') policy.active = body.active;
-    if (typeof body.preferredModelId === 'string') policy.preferredModelId = body.preferredModelId;
-    if (typeof body.fallbackModelId === 'string') policy.fallbackModelId = body.fallbackModelId;
-    appendAuditLog(store, {
+    await repo.appendAuditLog({
       actorId: actor.id,
       action: 'admin.policy.updated',
       resourceType: 'routing_policy',

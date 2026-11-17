@@ -17,6 +17,7 @@ import {
   ShieldCheck,
   X,
 } from 'lucide-react';
+import { AvarestLogo } from './AvarestLogo.tsx';
 import type { TranslationBundle } from '../i18n/translations.ts';
 import type { ExperienceMode, UserProfile } from '../shared/types.ts';
 
@@ -116,20 +117,10 @@ export function Sidebar({
     <div className="flex flex-col h-full">
       {/* Brand header inside sidebar */}
       <div className="h-14 px-4 flex items-center justify-between border-b border-slate-200 dark:border-slate-800 shrink-0">
-        {!isCollapsed && (
-          <div className="flex items-center gap-2.5 min-w-0">
-            <div className="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center text-white shrink-0">
-              <Brain className="w-4 h-4" />
-            </div>
-            <span className="font-display font-bold text-base tracking-tight text-slate-900 dark:text-white truncate">
-              {t.brandName}
-            </span>
-          </div>
-        )}
-        {isCollapsed && (
-          <div className="w-7 h-7 mx-auto rounded-lg bg-indigo-600 flex items-center justify-center text-white">
-            <Brain className="w-4 h-4" />
-          </div>
+        {!isCollapsed ? (
+          <AvarestLogo variant="horizontal" size="sm" />
+        ) : (
+          <AvarestLogo variant="compact" size="sm" className="mx-auto" />
         )}
         <button
           type="button"

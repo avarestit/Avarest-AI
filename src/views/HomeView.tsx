@@ -14,6 +14,7 @@ import { useAuth } from '../context/AuthContext.tsx';
 import type { TranslationBundle } from '../i18n/translations.ts';
 import { avarestApi } from '../lib/api.ts';
 import type { Conversation, Project, UsageSummary } from '../shared/types.ts';
+import { AvarestLogo } from '../components/AvarestLogo.tsx';
 import type { NavSection } from '../components/Sidebar.tsx';
 
 interface HomeViewProps {
@@ -117,13 +118,16 @@ export function HomeView({
     <div className="max-w-5xl mx-auto w-full space-y-8 py-4">
       {/* Hero AI Prompt Area */}
       <section className="bg-white dark:bg-[#0B1120] border border-slate-200 dark:border-slate-800 rounded-2xl p-6 sm:p-8 space-y-6">
-        <div className="space-y-2 max-w-2xl">
-          <h2 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white text-balance">
-            {t.home.welcomeTitle}
-          </h2>
-          <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-            {t.home.welcomeSubtitle}
-          </p>
+        <div className="flex items-start gap-4 max-w-2xl">
+          <AvarestLogo variant="mark" size="lg" className="hidden sm:inline-flex mt-0.5" />
+          <div className="space-y-2">
+            <h2 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white text-balance">
+              {t.home.welcomeTitle}
+            </h2>
+            <p className="text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
+              {t.home.welcomeSubtitle}
+            </p>
+          </div>
         </div>
 
         <form onSubmit={handleSubmit} className="flex flex-col sm:flex-row gap-3">
@@ -194,7 +198,7 @@ export function HomeView({
         <div className="bg-white dark:bg-[#0B1120] border border-slate-200 dark:border-slate-800 rounded-xl p-5 space-y-1">
           <div className="text-xs text-slate-500 dark:text-slate-400">Configured AI Providers</div>
           <div className="font-mono text-2xl font-semibold text-slate-900 dark:text-white tabular-nums">
-            {configuredProvidersCount} / {health?.providers.length ?? 6}
+            {configuredProvidersCount} / {health?.providers.length ?? 4}
           </div>
           <div className="text-xs text-slate-500 dark:text-slate-400">
             {configuredProvidersCount > 0

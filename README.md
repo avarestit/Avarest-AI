@@ -12,12 +12,12 @@
 AVAREST AI (Master Brand)
  └── AVAREST ONE (User Workspace, Chat, Research, Coder, Studio, Agents, Admin Console)
       └── AVAREST BRAIN (Internal Task Classifier, Capability Registry, Router, Fallback, Metering)
-           └── SERVER-SIDE PROVIDER ADAPTERS (Gemini, OpenAI, Anthropic, DeepSeek, xAI Grok, Meta Llama)
+           └── SERVER-SIDE PROVIDER ADAPTERS (OpenAI, Google Gemini, Anthropic Claude, DeepSeek)
 ```
 
-- **Frontend:** React 19, TypeScript, Vite, Tailwind CSS v4, English & Bengali (`বাংলা`) support, Beginner & Advanced modes.
+- **Frontend:** React 19, TypeScript, Vite, Tailwind CSS v4, Light/Dark/System theme, English & Bengali (`বাংলা`) support, Beginner & Advanced modes.
 - **API & Orchestration:** Edge-compatible **Hono** API (`/src/server/app.ts`) running via `server.ts` locally/Cloud Run and `/src/worker.ts` on Cloudflare Workers.
-- **Database & Auth:** Supabase Auth + PostgreSQL + pgvector + Row Level Security (`/supabase/migrations/0001_initial_schema.sql`).
+- **Database & Auth:** Supabase Auth + PostgreSQL + pgvector + Storage + Row Level Security (`/supabase/migrations/0001_initial_schema.sql` & `/supabase/migrations/0002_security_hardening.sql`).
 
 ## Supabase Environments & Strict Isolation
 

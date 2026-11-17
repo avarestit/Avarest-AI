@@ -1,5 +1,10 @@
 import { normalizeEnvironment, validateEnvironmentIsolation, type EnvironmentName } from '../shared/env.ts';
 
+export interface KVNamespaceLike {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
+}
+
 export interface ServerBindings {
   AVAREST_ENVIRONMENT?: string;
   VITE_ENVIRONMENT?: string;
@@ -9,6 +14,7 @@ export interface ServerBindings {
   VITE_SUPABASE_URL?: string;
   VITE_SUPABASE_ANON_KEY?: string;
   AUTH_SESSION_SECRET?: string;
+  ADMIN_BOOTSTRAP_SECRET?: string;
   GEMINI_API_KEY?: string;
   OPENAI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
@@ -18,6 +24,7 @@ export interface ServerBindings {
   LLAMA_API_BASE_URL?: string;
   GITHUB_CLIENT_ID?: string;
   GOOGLE_CLIENT_ID?: string;
+  RATE_LIMIT_KV?: KVNamespaceLike;
 }
 
 export interface ResolvedServerConfig {
@@ -29,6 +36,8 @@ export interface ResolvedServerConfig {
   supabaseConfigured: boolean;
   isolationErrors: string[];
   authSessionSecret: string;
+  adminBootstrapSecret: string | undefined;
+  hasRateLimitKv: boolean;
   providers: {
     gemini: string | undefined;
     openai: string | undefined;
@@ -50,7 +59,7 @@ function readVar(bindings: ServerBindings | undefined, key: keyof ServerBindings
     return fromBinding.trim();
   }
   if (typeof process !== 'undefined' && process.env) {
-    const fromProcess = process.env[key];
+    const fromProcess = process.env[key as string];
     if (typeof fromProcess === 'string' && fromProcess.trim().length > 0) {
       return fromProcess.trim();
     }
@@ -84,6 +93,8 @@ export function getServerConfig(bindings?: ServerBindings): ResolvedServerConfig
     supabaseConfigured: Boolean(supabaseUrl && supabaseServiceRoleKey && validation.valid),
     isolationErrors: validation.errors,
     authSessionSecret: configuredSecret || EPHEMERAL_LOCAL_SECRET,
+    adminBootstrapSecret: readVar(bindings, 'ADMIN_BOOTSTRAP_SECRET'),
+    hasRateLimitKv: Boolean(bindings?.RATE_LIMIT_KV),
     providers: {
       gemini: readVar(bindings, 'GEMINI_API_KEY'),
       openai: readVar(bindings, 'OPENAI_API_KEY'),

@@ -16,7 +16,6 @@ import type {
   UserRole,
 } from '../../shared/types.ts';
 import { DEFAULT_ROUTING_POLICIES, type RoutingPolicyRule } from '../brain/router.ts';
-import { hashPassword } from './crypto.ts';
 
 export interface StoredUser extends UserProfile {
   passwordHash: string;
@@ -88,7 +87,7 @@ const DEFAULT_FLAGS: FeatureFlag[] = [
 ];
 
 export function createStore(): WorkspaceStore {
-  const store: WorkspaceStore = {
+  return {
     users: new Map(),
     usersByEmail: new Map(),
     projects: new Map(),
@@ -109,57 +108,10 @@ export function createStore(): WorkspaceStore {
     auditLogs: [],
     featureFlags: new Map(DEFAULT_FLAGS.map((f) => [f.key, { ...f }])),
   };
-
-  return store;
 }
 
-// Singleton workspace store for the running process; tests can instantiate isolated stores via createStore()
+// Local staging/development process store ONLY; production refuses in-memory persistence.
 export const defaultStore = createStore();
-
-let seeded = false;
-export async function ensureSeededSandboxAccounts(store: WorkspaceStore = defaultStore): Promise<void> {
-  if (seeded && store.users.size > 0) return;
-
-  if (!store.usersByEmail.has('admin@avarestai.com')) {
-    const adminId = '00000000-0000-4000-8000-000000000001';
-    const adminHash = await hashPassword('AvarestAdmin#2026');
-    store.users.set(adminId, {
-      id: adminId,
-      email: 'admin@avarestai.com',
-      fullName: 'Avarest Platform Admin',
-      role: 'super_admin',
-      language: 'en',
-      experienceMode: 'advanced',
-      memoryConsent: false,
-      activePlan: 'enterprise',
-      createdAt: new Date().toISOString(),
-      passwordHash: adminHash,
-    });
-    store.usersByEmail.set('admin@avarestai.com', adminId);
-    store.credits.set(adminId, { balance: 1000, monthlyAllowance: 1000 });
-  }
-
-  if (!store.usersByEmail.has('user@avarestai.com')) {
-    const userId = '00000000-0000-4000-8000-000000000002';
-    const userHash = await hashPassword('AvarestUser#2026');
-    store.users.set(userId, {
-      id: userId,
-      email: 'user@avarestai.com',
-      fullName: 'Demo Workspace User',
-      role: 'user',
-      language: 'en',
-      experienceMode: 'beginner',
-      memoryConsent: false,
-      activePlan: 'free',
-      createdAt: new Date().toISOString(),
-      passwordHash: userHash,
-    });
-    store.usersByEmail.set('user@avarestai.com', userId);
-    store.credits.set(userId, { balance: 100, monthlyAllowance: 100 });
-  }
-
-  seeded = true;
-}
 
 export function sanitizeUser(u: StoredUser): UserProfile {
   const { passwordHash: _ignored, ...profile } = u;
@@ -169,32 +121,49 @@ export function sanitizeUser(u: StoredUser): UserProfile {
 export function appendAuditLog(
   store: WorkspaceStore,
   entry: Omit<AuditLogEntry, 'id' | 'createdAt'>,
-): void {
-  store.auditLogs.unshift({
+): AuditLogEntry {
+  const full: AuditLogEntry = {
     id: crypto.randomUUID(),
     ...entry,
     createdAt: new Date().toISOString(),
-  });
+  };
+  store.auditLogs.unshift(full);
   if (store.auditLogs.length > 500) {
     store.auditLogs.length = 500;
   }
+  return full;
 }
 
 export function deductCreditsAtomic(
   store: WorkspaceStore,
   params: { userId: string; amount: number; reason: string; referenceId?: string },
 ): number {
-  const acct = store.credits.get(params.userId) || { balance: 100, monthlyAllowance: 100 };
+  const acct = store.credits.get(params.userId);
+  if (!acct) {
+    throw new Error('CREDIT_ACCOUNT_NOT_FOUND');
+  }
   if (params.amount <= 0) return acct.balance;
+
+  // Idempotent guard: prevent duplicate deduction for the same referenceId
+  if (params.referenceId) {
+    const existing = store.creditLedger.find(
+      (entry) => entry.userId === params.userId && entry.referenceId === params.referenceId,
+    );
+    if (existing) {
+      return existing.balanceAfter;
+    }
+  }
+
   if (acct.balance < params.amount) {
     throw new Error('INSUFFICIENT_CREDITS');
   }
+
   const nextBalance = Number((acct.balance - params.amount).toFixed(4));
   store.credits.set(params.userId, { ...acct, balance: nextBalance });
   store.creditLedger.unshift({
     id: crypto.randomUUID(),
     userId: params.userId,
-    delta: -params.amount,
+    delta: -Number(params.amount.toFixed(4)),
     balanceAfter: nextBalance,
     reason: params.reason,
     referenceId: params.referenceId || null,
@@ -204,7 +173,7 @@ export function deductCreditsAtomic(
 }
 
 export function getUserUsageSummary(store: WorkspaceStore, userId: string): UsageSummary {
-  const acct = store.credits.get(userId) || { balance: 100, monthlyAllowance: 100 };
+  const acct = store.credits.get(userId) || { balance: 0, monthlyAllowance: 100 };
   const userRecords = store.usageRecords.filter((r) => r.userId === userId);
   const ledger = store.creditLedger.filter((l) => l.userId === userId).slice(0, 50);
 

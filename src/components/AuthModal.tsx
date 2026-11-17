@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { AlertCircle, Lock, X } from 'lucide-react';
+import { AlertCircle, CheckCircle2, X } from 'lucide-react';
 import { useAuth } from '../context/AuthContext.tsx';
 import type { TranslationBundle } from '../i18n/translations.ts';
+import { AvarestLogo } from './AvarestLogo.tsx';
 
 interface AuthModalProps {
   open: boolean;
@@ -16,6 +17,7 @@ export function AuthModal({ open, onClose, t }: AuthModalProps) {
   const [password, setPassword] = useState('');
   const [fullName, setFullName] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [infoMsg, setInfoMsg] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   if (!open) return null;
@@ -25,29 +27,23 @@ export function AuthModal({ open, onClose, t }: AuthModalProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setInfoMsg(null);
     setSubmitting(true);
     try {
       if (mode === 'signin') {
         await signIn(email, password);
+        onClose();
       } else {
-        await register(email, password, fullName);
+        const res = await register(email, password, fullName);
+        if (res.emailConfirmationRequired) {
+          setInfoMsg('Account created. Check your inbox to confirm your email before signing in.');
+          setMode('signin');
+        } else {
+          onClose();
+        }
       }
-      onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Authentication failed.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  const quickLogin = async (presetEmail: string, presetPass: string) => {
-    setError(null);
-    setSubmitting(true);
-    try {
-      await signIn(presetEmail, presetPass);
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Sign in failed.');
     } finally {
       setSubmitting(false);
     }
@@ -57,13 +53,16 @@ export function AuthModal({ open, onClose, t }: AuthModalProps) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs">
       <div className="w-full max-w-md bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 p-6 shadow-xl">
         <div className="flex items-center justify-between mb-5">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-indigo-50 dark:bg-indigo-950 text-indigo-600 dark:text-indigo-400 flex items-center justify-center">
-              <Lock className="w-4 h-4" />
+          <div className="flex items-center gap-3">
+            <AvarestLogo variant="mark" size="md" />
+            <div>
+              <h2 className="font-display font-bold text-lg text-slate-900 dark:text-white leading-tight">
+                {mode === 'signin' ? t.auth.signInTitle : t.auth.signUpTitle}
+              </h2>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                {t.brandTagline}
+              </p>
             </div>
-            <h2 className="font-display font-bold text-lg text-slate-900 dark:text-white">
-              {mode === 'signin' ? t.auth.signInTitle : t.auth.signUpTitle}
-            </h2>
           </div>
           <button
             type="button"
@@ -76,26 +75,15 @@ export function AuthModal({ open, onClose, t }: AuthModalProps) {
         </div>
 
         {isLocalSandbox && (
-          <div className="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 text-xs text-amber-800 dark:text-amber-200 space-y-2">
-            <p>{t.auth.sandboxNotice}</p>
-            <div className="flex flex-wrap gap-2 pt-1">
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={() => quickLogin('user@avarestai.com', 'AvarestUser#2026')}
-                className="px-2.5 py-1 rounded-md bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 font-medium hover:bg-amber-100 dark:hover:bg-amber-900/50 transition-colors"
-              >
-                Use Standard User
-              </button>
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={() => quickLogin('admin@avarestai.com', 'AvarestAdmin#2026')}
-                className="px-2.5 py-1 rounded-md bg-white dark:bg-slate-900 border border-amber-300 dark:border-amber-700 font-medium hover:bg-amber-100 dark:hover:bg-amber-900/50 transition-colors"
-              >
-                Use Platform Admin
-              </button>
-            </div>
+          <div className="mb-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 text-xs text-amber-800 dark:text-amber-200">
+            {t.auth.sandboxNotice} Create an account below to begin a local staging session.
+          </div>
+        )}
+
+        {infoMsg && (
+          <div className="mb-4 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-700 dark:text-emerald-300 flex items-start gap-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>{infoMsg}</span>
           </div>
         )}
 
@@ -167,6 +155,7 @@ export function AuthModal({ open, onClose, t }: AuthModalProps) {
             type="button"
             onClick={() => {
               setError(null);
+              setInfoMsg(null);
               setMode(mode === 'signin' ? 'signup' : 'signin');
             }}
             className="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline"

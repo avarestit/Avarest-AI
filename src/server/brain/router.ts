@@ -6,7 +6,7 @@ import type {
 } from '../../shared/types.ts';
 import type { ResolvedServerConfig } from '../env.ts';
 import { classifyPromptTask } from './classifier.ts';
-import { getModelRegistry } from './registry.ts';
+import { getModelRegistry, isProviderEnabledForRelease } from './registry.ts';
 
 export interface RoutingPolicyRule {
   id: string;
@@ -24,7 +24,7 @@ export const DEFAULT_ROUTING_POLICIES: RoutingPolicyRule[] = [
     name: 'General Conversation',
     taskCategory: 'general_chat',
     preferredModelId: 'gemini-4-hydrogen',
-    fallbackModelId: 'gemini-3.1-flash-lite',
+    fallbackModelId: 'gpt-4o-mini',
     maxCostTier: 'standard',
     active: true,
   },
@@ -33,7 +33,7 @@ export const DEFAULT_ROUTING_POLICIES: RoutingPolicyRule[] = [
     name: 'Software Engineering & Code',
     taskCategory: 'coding',
     preferredModelId: 'claude-3-5-sonnet-latest',
-    fallbackModelId: 'gemini-4-hydrogen',
+    fallbackModelId: 'deepseek-chat',
     maxCostTier: 'premium',
     active: true,
   },
@@ -42,7 +42,7 @@ export const DEFAULT_ROUTING_POLICIES: RoutingPolicyRule[] = [
     name: 'Deep Research & Grounding',
     taskCategory: 'research',
     preferredModelId: 'gemini-4-hydrogen',
-    fallbackModelId: 'grok-2-latest',
+    fallbackModelId: 'gemini-3.1-flash-lite',
     maxCostTier: 'standard',
     active: true,
   },
@@ -51,7 +51,7 @@ export const DEFAULT_ROUTING_POLICIES: RoutingPolicyRule[] = [
     name: 'Architecture & Deep Reasoning',
     taskCategory: 'reasoning',
     preferredModelId: 'gpt-4o',
-    fallbackModelId: 'gemini-4-hydrogen',
+    fallbackModelId: 'deepseek-reasoner',
     maxCostTier: 'premium',
     active: true,
   },
@@ -60,7 +60,7 @@ export const DEFAULT_ROUTING_POLICIES: RoutingPolicyRule[] = [
     name: 'Long-Context Document Analysis',
     taskCategory: 'document_analysis',
     preferredModelId: 'gemini-4-hydrogen',
-    fallbackModelId: 'gemini-3.1-flash-lite',
+    fallbackModelId: 'claude-3-5-haiku-latest',
     maxCostTier: 'standard',
     active: true,
   },
@@ -99,13 +99,13 @@ export function routeWithAvarestBrain(params: {
   userPlan?: PlanTier;
   policies?: RoutingPolicyRule[];
 }): RoutingDecision {
-  const registry = getModelRegistry(params.config);
+  const registry = getModelRegistry(params.config).filter((m) => isProviderEnabledForRelease(m.providerId));
   const configuredModels = registry.filter((m) => m.configured);
 
   if (configuredModels.length === 0) {
     throw new BrainRoutingError(
       'NO_CONFIGURED_PROVIDERS',
-      'No AI provider API keys are configured on the server. Add GEMINI_API_KEY (or OpenAI/Anthropic/DeepSeek keys) in server Secrets.',
+      'No active AI provider API keys are configured on the server. Configure OpenAI, Google Gemini, Anthropic Claude, or DeepSeek in server Secrets.',
       503,
     );
   }
@@ -118,7 +118,7 @@ export function routeWithAvarestBrain(params: {
     if (!requested) {
       throw new BrainRoutingError(
         'MODEL_NOT_FOUND',
-        `Requested model "${params.requestedModelId}" is not registered in Avarest Brain.`,
+        `Requested model "${params.requestedModelId}" is not available in the active Avarest Brain registry.`,
         400,
       );
     }
@@ -191,6 +191,6 @@ export function routeWithAvarestBrain(params: {
     selectedProvider: best.providerId,
     selectedModel: best.id,
     reason: `Capability-based routing selected ${best.displayName} for "${classification.category}".`,
-    fallbackUsed: false,
+    fallbackUsed: Boolean(matchingPolicy),
   };
 }

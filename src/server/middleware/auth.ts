@@ -2,12 +2,15 @@ import type { Context, Next } from 'hono';
 import type { UserProfile } from '../../shared/types.ts';
 import type { ResolvedServerConfig, ServerBindings } from '../env.ts';
 import { verifySessionToken } from '../lib/crypto.ts';
-import { ensureSeededSandboxAccounts, isAdminRole, sanitizeUser, type WorkspaceStore } from '../lib/store.ts';
+import type { WorkspaceRepository } from '../lib/repository.ts';
+import { isAdminRole, sanitizeUser } from '../lib/store.ts';
+import type { RateLimitAdapter } from './rateLimit.ts';
 
 export interface AuthContextVariables {
   requestId: string;
   serverConfig: ResolvedServerConfig;
-  store: WorkspaceStore;
+  repo: WorkspaceRepository | null;
+  rateLimiter: RateLimitAdapter;
   currentUser: UserProfile;
 }
 
@@ -16,8 +19,20 @@ export async function authenticateRequest(
   next: Next,
 ) {
   const config = c.get('serverConfig');
-  const store = c.get('store');
-  await ensureSeededSandboxAccounts(store);
+  const repo = c.get('repo');
+
+  if (!repo) {
+    return c.json(
+      {
+        error: {
+          code: 'DATABASE_NOT_CONFIGURED',
+          message: 'Production runtime requires configured Supabase database credentials.',
+          requestId: c.get('requestId'),
+        },
+      },
+      503,
+    );
+  }
 
   const authHeader = c.req.header('Authorization') || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
@@ -35,13 +50,14 @@ export async function authenticateRequest(
     );
   }
 
-  // 1. If Supabase is configured, validate token directly with Supabase Auth
-  if (config.supabaseConfigured && config.supabaseUrl && config.supabaseAnonKey) {
+  // 1. If Supabase is configured, verify JWT directly with Supabase Auth & load persistent profile
+  if (config.supabaseConfigured && config.supabaseUrl && (config.supabaseAnonKey || config.supabaseServiceRoleKey)) {
+    const apiKeyHeader = config.supabaseAnonKey || config.supabaseServiceRoleKey!;
     try {
       const res = await fetch(`${config.supabaseUrl}/auth/v1/user`, {
         headers: {
           Authorization: `Bearer ${token}`,
-          apikey: config.supabaseAnonKey,
+          apikey: apiKeyHeader,
         },
       });
       if (!res.ok) {
@@ -51,25 +67,12 @@ export async function authenticateRequest(
         );
       }
       const supaUser = (await res.json()) as { id: string; email?: string; user_metadata?: { full_name?: string } };
-      let stored = store.users.get(supaUser.id);
-      if (!stored) {
-        // Hydrate workspace profile record
-        stored = {
-          id: supaUser.id,
-          email: supaUser.email || 'unknown@avarestai.com',
-          fullName: supaUser.user_metadata?.full_name || supaUser.email || 'Avarest User',
-          role: 'user',
-          language: 'en',
-          experienceMode: 'beginner',
-          memoryConsent: false,
-          activePlan: 'free',
-          createdAt: new Date().toISOString(),
-          passwordHash: '',
-        };
-        store.users.set(supaUser.id, stored);
-        store.credits.set(supaUser.id, { balance: 100, monthlyAllowance: 100 });
-      }
-      c.set('currentUser', sanitizeUser(stored));
+      const profile = await repo.upsertProfileFromSupabaseAuth({
+        id: supaUser.id,
+        email: supaUser.email || 'unknown@avarestai.com',
+        fullName: supaUser.user_metadata?.full_name || supaUser.email || 'Avarest User',
+      });
+      c.set('currentUser', profile);
       await next();
       return;
     } catch {
@@ -102,7 +105,7 @@ export async function authenticateRequest(
     );
   }
 
-  const stored = store.users.get(payload.sub);
+  const stored = await repo.getUserById(payload.sub);
   if (!stored) {
     return c.json(
       { error: { code: 'UNAUTHORIZED', message: 'Session user no longer exists.', requestId: c.get('requestId') } },
@@ -132,41 +135,4 @@ export async function requireAdmin(
     );
   }
   await next();
-}
-
-// Sliding-window in-memory rate limiter (Edge-compatible)
-const rateLimitBuckets = new Map<string, { count: number; resetAt: number }>();
-
-export function rateLimit(maxRequests: number, windowMs: number) {
-  return async (
-    c: Context<{ Bindings: ServerBindings; Variables: AuthContextVariables }>,
-    next: Next,
-  ) => {
-    const user = c.get('currentUser');
-    const key = `${user?.id || c.req.header('x-forwarded-for') || 'anon'}:${c.req.path}`;
-    const now = Date.now();
-    const existing = rateLimitBuckets.get(key);
-
-    if (!existing || now > existing.resetAt) {
-      rateLimitBuckets.set(key, { count: 1, resetAt: now + windowMs });
-      await next();
-      return;
-    }
-
-    if (existing.count >= maxRequests) {
-      return c.json(
-        {
-          error: {
-            code: 'RATE_LIMITED',
-            message: 'Too many requests. Please wait briefly before retrying.',
-            requestId: c.get('requestId'),
-          },
-        },
-        429,
-      );
-    }
-
-    existing.count += 1;
-    await next();
-  };
 }

@@ -12,6 +12,10 @@ interface StaticModelDef {
   latencyTier: ModelCapabilitySpec['latencyTier'];
 }
 
+export const ACTIVE_PROVIDER_IDS: readonly ProviderId[] = ['gemini', 'openai', 'anthropic', 'deepseek'] as const;
+
+// Four active providers for initial release: Google Gemini, OpenAI, Anthropic Claude, DeepSeek.
+// xAI Grok and Meta Llama adapters remain disabled until future expansion.
 const MODEL_CATALOG: StaticModelDef[] = [
   {
     id: 'gemini-4-hydrogen',
@@ -64,6 +68,16 @@ const MODEL_CATALOG: StaticModelDef[] = [
     latencyTier: 'fast',
   },
   {
+    id: 'claude-3-5-haiku-latest',
+    providerId: 'anthropic',
+    providerName: 'Anthropic Claude',
+    displayName: 'Claude 3.5 Haiku',
+    capabilities: ['chat', 'streaming', 'coding'],
+    contextWindow: 200000,
+    costTier: 'economy',
+    latencyTier: 'ultra_fast',
+  },
+  {
     id: 'deepseek-chat',
     providerId: 'deepseek',
     providerName: 'DeepSeek',
@@ -74,28 +88,25 @@ const MODEL_CATALOG: StaticModelDef[] = [
     latencyTier: 'fast',
   },
   {
-    id: 'grok-2-latest',
-    providerId: 'xai',
-    providerName: 'xAI Grok',
-    displayName: 'Grok 2',
-    capabilities: ['chat', 'streaming', 'research'],
-    contextWindow: 131072,
+    id: 'deepseek-reasoner',
+    providerId: 'deepseek',
+    providerName: 'DeepSeek',
+    displayName: 'DeepSeek R1',
+    capabilities: ['chat', 'streaming', 'reasoning', 'coding'],
+    contextWindow: 64000,
     costTier: 'standard',
-    latencyTier: 'fast',
-  },
-  {
-    id: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
-    providerId: 'llama',
-    providerName: 'Meta Llama',
-    displayName: 'Llama 3.3 70B Instruct',
-    capabilities: ['chat', 'streaming', 'coding'],
-    contextWindow: 128000,
-    costTier: 'economy',
-    latencyTier: 'fast',
+    latencyTier: 'reasoning',
   },
 ];
 
+export function isProviderEnabledForRelease(providerId: ProviderId): boolean {
+  return (ACTIVE_PROVIDER_IDS as readonly string[]).includes(providerId);
+}
+
 export function isProviderConfigured(providerId: ProviderId, config: ResolvedServerConfig): boolean {
+  if (!isProviderEnabledForRelease(providerId)) {
+    return false;
+  }
   switch (providerId) {
     case 'gemini':
       return Boolean(config.providers.gemini);
@@ -105,10 +116,8 @@ export function isProviderConfigured(providerId: ProviderId, config: ResolvedSer
       return Boolean(config.providers.anthropic);
     case 'deepseek':
       return Boolean(config.providers.deepseek);
-    case 'xai':
-      return Boolean(config.providers.xai);
-    case 'llama':
-      return Boolean(config.providers.llama);
+    default:
+      return false;
   }
 }
 
@@ -131,12 +140,10 @@ export function getProviderSummary(config: ResolvedServerConfig): Array<{
   configured: boolean;
 }> {
   const entries: Array<{ id: ProviderId; displayName: string }> = [
-    { id: 'gemini', displayName: 'Google Gemini' },
     { id: 'openai', displayName: 'OpenAI' },
+    { id: 'gemini', displayName: 'Google Gemini' },
     { id: 'anthropic', displayName: 'Anthropic Claude' },
     { id: 'deepseek', displayName: 'DeepSeek' },
-    { id: 'xai', displayName: 'xAI Grok' },
-    { id: 'llama', displayName: 'Meta Llama' },
   ];
   return entries.map((entry) => ({
     ...entry,

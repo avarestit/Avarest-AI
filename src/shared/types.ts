@@ -56,6 +56,7 @@ export interface ChatMessage {
   routingReason?: string | null;
   inputTokens: number;
   outputTokens: number;
+  usageIsEstimated?: boolean;
   citations: CitationItem[];
   createdAt: string;
 }
@@ -161,6 +162,8 @@ export interface KnowledgeDocument {
   mimeType: string;
   byteSize: number;
   chunkCount: number;
+  storagePath?: string | null;
+  retrievalMode?: 'keyword_rank' | 'pgvector_hybrid';
   createdAt: string;
 }
 
@@ -212,11 +215,16 @@ export interface UsageSummary {
 export interface SystemHealthStatus {
   status: 'ok' | 'degraded';
   environment: 'staging' | 'production';
+  storageMode: 'supabase_postgres' | 'local_memory_sandbox' | 'unconfigured_blocked';
+  rateLimitMode: 'distributed_kv' | 'single_instance_memory';
   supabase: {
     expectedUrl: string;
     configured: boolean;
+    dbReachable: boolean;
+    dbLatencyMs?: number;
+    dbError?: string;
     isolated: boolean;
-    authMode: 'supabase' | 'local_sandbox';
+    authMode: 'supabase' | 'local_sandbox' | 'unconfigured_blocked';
     errors: string[];
   };
   providers: Array<{

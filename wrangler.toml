@@ -1,6 +1,8 @@
 # ==============================================================================
 # AVAREST ONE — CLOUDFLARE WORKERS CONFIGURATION
 # Do NOT put secrets in this file. Use `wrangler secret put` for keys.
+# Optional Distributed Rate Limiter: bind a KV namespace as `RATE_LIMIT_KV`
+# (or attach a Durable Object) in Cloudflare Workers for cross-PoP enforcement.
 # ==============================================================================
 name = "avarest-one-api"
 main = "src/worker.ts"
@@ -10,6 +12,11 @@ compatibility_date = "2025-11-01"
 AVAREST_ENVIRONMENT = "staging"
 SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
 APP_URL = "https://staging.avarestai.com"
+
+# Uncomment and set your Cloudflare KV namespace ID for distributed edge rate limiting:
+# [[kv_namespaces]]
+# binding = "RATE_LIMIT_KV"
+# id = "YOUR_STAGING_KV_NAMESPACE_ID"
 
 [env.staging]
 name = "avarest-one-api-staging"
