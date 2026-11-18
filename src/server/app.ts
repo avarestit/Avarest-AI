@@ -450,66 +450,78 @@ export function createAvarestApiApp(options?: {
     }
 
     const email = parsed.data.email.toLowerCase().trim();
-    const existingUser = await repo.getUserByEmail(email);
-
-    if (existingUser) {
-      const promoted = await repo.updateUserRole(existingUser.id, 'super_admin');
-      await repo.appendAuditLog({
-        actorId: existingUser.id,
-        action: 'admin.bootstrap.promote',
-        resourceType: 'profile',
-        resourceId: existingUser.id,
-        detail: `Bootstrapped initial super_admin for ${email}`,
-      });
-      return c.json({ user: promoted }, 200);
-    }
-
     if (config.supabaseConfigured) {
-      return c.json(
-        {
-          error: {
-            code: 'USER_NOT_FOUND',
-            message: 'Register the user via Supabase Auth first, then invoke bootstrap with their email to promote.',
-            requestId: c.get('requestId'),
+      const existingUser = await repo.getUserByEmail(email);
+      if (!existingUser) {
+        return c.json(
+          {
+            error: {
+              code: 'USER_NOT_FOUND',
+              message: 'Register the user via Supabase Auth first, then invoke bootstrap with their email to promote.',
+              requestId: c.get('requestId'),
+            },
           },
-        },
-        404,
-      );
-    }
-
-    if (!parsed.data.password) {
+          404,
+        );
+      }
+    } else if (!parsed.data.password) {
       return c.json(
         { error: { code: 'VALIDATION_ERROR', message: 'Password (min 12 chars) required to create initial sandbox admin.', requestId: c.get('requestId') } },
         400,
       );
     }
 
-    const id = crypto.randomUUID();
-    const passwordHash = await hashPassword(parsed.data.password);
-    const created = await repo.createLocalUser(
-      {
-        id,
+    try {
+      const passwordHash = parsed.data.password ? await hashPassword(parsed.data.password) : undefined;
+      const promotedOrCreated = await repo.bootstrapAdmin({
         email,
-        fullName: parsed.data.fullName?.trim() || 'Platform Administrator',
-        role: 'super_admin',
-        language: 'en',
-        experienceMode: 'advanced',
-        memoryConsent: false,
-        activePlan: 'enterprise',
-        createdAt: new Date().toISOString(),
+        fullName: parsed.data.fullName,
         passwordHash,
-      },
-      1000,
-    );
-    await repo.appendAuditLog({
-      actorId: id,
-      action: 'admin.bootstrap.create',
-      resourceType: 'profile',
-      resourceId: id,
-      detail: `Created initial super_admin ${email}`,
-    });
+      });
 
-    return c.json({ user: created }, 201);
+      await repo.appendAuditLog({
+        actorId: promotedOrCreated.id,
+        action: 'admin.bootstrap.success',
+        resourceType: 'profile',
+        resourceId: promotedOrCreated.id,
+        detail: `Bootstrapped initial super_admin for ${email}`,
+      });
+
+      return c.json({ user: promotedOrCreated }, 201);
+    } catch (err) {
+      if (err instanceof Error && err.message === 'ADMIN_ALREADY_EXISTS') {
+        await repo.appendAuditLog({
+          actorId: 'system',
+          action: 'admin.bootstrap.locked_attempt',
+          resourceType: 'admin_bootstrap',
+          resourceId: null,
+          detail: 'Blocked bootstrap replay attempt because a platform administrator already exists.',
+        });
+        return c.json(
+          { error: { code: 'ADMIN_ALREADY_EXISTS', message: 'Bootstrap locked: a platform administrator already exists.', requestId: c.get('requestId') } },
+          409,
+        );
+      }
+      await repo
+        .appendAuditLog({
+          actorId: 'system',
+          action: 'admin.bootstrap.verification_failed',
+          resourceType: 'admin_bootstrap',
+          resourceId: null,
+          detail: `Blocked bootstrap because administrator verification failed: ${err instanceof Error ? err.message : 'database error'}`,
+        })
+        .catch(() => {});
+      return c.json(
+        {
+          error: {
+            code: 'BOOTSTRAP_VERIFICATION_FAILED',
+            message: 'Unable to verify existing administrator state. Bootstrap is blocked.',
+            requestId: c.get('requestId'),
+          },
+        },
+        503,
+      );
+    }
   });
 
   // =========================================================================

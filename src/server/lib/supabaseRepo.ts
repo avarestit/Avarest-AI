@@ -159,6 +159,40 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
     return this.mapProfileRow(data);
   }
 
+  async bootstrapAdmin(params: {
+    email: string;
+    fullName?: string;
+    passwordHash?: string;
+    initialCredits?: number;
+  }): Promise<UserProfile> {
+    const { data, error } = await this.db.rpc('bootstrap_admin', {
+      p_email: params.email,
+      p_full_name: params.fullName ?? 'Platform Administrator',
+      p_initial_credits: params.initialCredits ?? 1000,
+    });
+    if (error) {
+      if (error.message.includes('ADMIN_ALREADY_EXISTS') || error.message.toLowerCase().includes('already exists')) {
+        throw new Error('ADMIN_ALREADY_EXISTS');
+      }
+      throw new Error(error.message);
+    }
+    const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error('BOOTSTRAP_FAILED');
+    }
+    return {
+      id: String(row.user_id),
+      email: String(row.email),
+      fullName: String(row.full_name || 'Platform Administrator'),
+      role: (row.role as UserRole) || 'super_admin',
+      language: 'en',
+      experienceMode: 'advanced',
+      memoryConsent: false,
+      activePlan: 'enterprise',
+      createdAt: String(row.created_at || new Date().toISOString()),
+    };
+  }
+
   async listUsersWithCredits(): Promise<Array<UserProfile & { creditBalance: number }>> {
     const { data: profiles } = await this.db.from('profiles').select('*').order('created_at', { ascending: false });
     const { data: accounts } = await this.db.from('credit_accounts').select('user_id, balance');
@@ -258,6 +292,10 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
 
     const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
     if (!row) throw new Error('EMPTY_FINALIZE_CREDITS_RESPONSE');
+
+    if (row.status === 'expired') {
+      throw new Error('RESERVATION_EXPIRED');
+    }
 
     const { data: resRow } = await this.db
       .from('credit_reservations')

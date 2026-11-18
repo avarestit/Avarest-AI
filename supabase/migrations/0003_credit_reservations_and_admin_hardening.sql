@@ -1,5 +1,5 @@
 -- ============================================================================
--- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING (v2)
+-- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING (v3)
 -- Forward-only migration layered on top of 0001 and 0002.
 -- Target: Staging (wdbtszlcdliwacvztmjl). Never run directly on Production
 -- without staging verification and explicit release approval.
@@ -179,7 +179,6 @@ BEGIN
 
   v_ttl := GREATEST(10, LEAST(COALESCE(p_ttl_seconds, 300), 3600));
 
-  -- Lock credit account first to enforce strict global lock ordering and serialize concurrent spends
   SELECT ca.balance INTO v_current
   FROM public.credit_accounts ca
   WHERE ca.user_id = p_user_id
@@ -189,12 +188,10 @@ BEGIN
     RAISE EXCEPTION 'Credit account not found';
   END IF;
 
-  -- Reconcile any expired reservations for this user before checking or reusing reservation keys
   SELECT * INTO v_rec
   FROM public._reconcile_user_expired_reservations(p_user_id, v_current, 100);
   v_current := COALESCE(v_rec.next_balance, v_current);
 
-  -- Idempotency check under account lock
   SELECT * INTO v_existing
   FROM public.credit_reservations cr
   WHERE cr.user_id = p_user_id
@@ -202,8 +199,6 @@ BEGIN
   FOR UPDATE;
 
   IF FOUND THEN
-    -- If the existing reservation was active but has expired, reconcile it above.
-    -- If status is now expired or terminal, return explicit deduplicated status so API returns 409 conflict.
     RETURN QUERY SELECT
       v_existing.id,
       v_existing.status,
@@ -286,7 +281,7 @@ GRANT EXECUTE ON FUNCTION public.reserve_credits(UUID, NUMERIC, TEXT, TEXT, TEXT
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 4. ATOMIC FINALIZE RESERVATION RPC (Reconciles Actual Cost, Expiry Check & Overage Debt)
+-- 4. ATOMIC FINALIZE RESERVATION RPC (Co-transactional Expiry Reconciliation)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.finalize_credit_reservation(
   p_user_id UUID,
@@ -342,7 +337,6 @@ BEGIN
     RAISE EXCEPTION 'Credit account not found';
   END IF;
 
-  -- Reconcile expired holds for this user first
   SELECT * INTO v_rec
   FROM public._reconcile_user_expired_reservations(p_user_id, v_current, 100);
   v_current := COALESCE(v_rec.next_balance, v_current);
@@ -369,8 +363,14 @@ BEGIN
     RETURN;
   END IF;
 
-  -- If reservation has expired, it must not be finalized; ensure it is marked expired and raise RESERVATION_EXPIRED
+  -- Fix: Co-transactional expired reservation finalization attempt reconciliation (no transaction rollback)
   IF v_res.status = 'reserved' AND v_res.expires_at <= NOW() THEN
+    v_current := ROUND(v_current + v_res.reserved_amount, 4);
+    UPDATE public.credit_accounts
+    SET balance = v_current,
+        updated_at = NOW()
+    WHERE user_id = p_user_id;
+
     UPDATE public.credit_reservations
     SET status = 'expired',
         actual_amount = 0,
@@ -378,11 +378,38 @@ BEGIN
         released_at = NOW(),
         updated_at = NOW()
     WHERE id = v_res.id;
-    RAISE EXCEPTION 'RESERVATION_EXPIRED';
+
+    INSERT INTO public.credit_ledger (user_id, delta, balance_after, reason, reference_id)
+    VALUES (
+      p_user_id,
+      ROUND(v_res.reserved_amount, 4),
+      v_current,
+      'Expired reservation finalized attempt reconciled: ' || v_res.reason,
+      'resv:' || p_reference_id || ':expire'
+    )
+    ON CONFLICT (user_id, reference_id) WHERE reference_id IS NOT NULL DO NOTHING;
+
+    RETURN QUERY SELECT
+      v_res.id,
+      'expired'::TEXT,
+      v_res.reserved_amount,
+      0::NUMERIC,
+      0::NUMERIC,
+      v_current,
+      TRUE;
+    RETURN;
   END IF;
 
   IF v_res.status IN ('released', 'expired') THEN
-    RAISE EXCEPTION 'RESERVATION_NOT_ACTIVE:%', v_res.status;
+    RETURN QUERY SELECT
+      v_res.id,
+      v_res.status,
+      v_res.reserved_amount,
+      v_res.actual_amount,
+      v_res.uncollected_amount,
+      v_current,
+      TRUE;
+    RETURN;
   END IF;
 
   v_actual := ROUND(p_actual_amount, 4);
@@ -411,7 +438,6 @@ BEGIN
     END IF;
   ELSE
     v_extra_needed := ROUND(v_actual - v_res.reserved_amount, 4);
-    -- Never allow negative balance even if actual usage exceeds estimate
     v_collect := LEAST(v_current, v_extra_needed);
     v_uncollected := ROUND(v_extra_needed - v_collect, 4);
     v_next := ROUND(v_current - v_collect, 4);

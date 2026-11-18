@@ -58,6 +58,12 @@ export interface WorkspaceRepository {
   ): Promise<UserProfile | null>;
   countAdmins(): Promise<number>;
   updateUserRole(userId: string, role: UserRole): Promise<UserProfile | null>;
+  bootstrapAdmin(params: {
+    email: string;
+    fullName?: string;
+    passwordHash?: string;
+    initialCredits?: number;
+  }): Promise<UserProfile>;
   listUsersWithCredits(): Promise<Array<UserProfile & { creditBalance: number }>>;
 
   // Credits & Usage
@@ -259,6 +265,53 @@ export class MemoryWorkspaceRepository implements WorkspaceRepository {
     if (!stored) return null;
     stored.role = role;
     return sanitizeUser(stored);
+  }
+
+  async bootstrapAdmin(params: {
+    email: string;
+    fullName?: string;
+    passwordHash?: string;
+    initialCredits?: number;
+  }): Promise<UserProfile> {
+    const existingAdmins = Array.from(this.store.users.values()).filter((u) => isAdminRole(u.role));
+    if (existingAdmins.length > 0) {
+      throw new Error('ADMIN_ALREADY_EXISTS');
+    }
+    const normalizedEmail = params.email.toLowerCase().trim();
+    const existingId = this.store.usersByEmail.get(normalizedEmail);
+    const existingUser = existingId ? this.store.users.get(existingId) : null;
+    if (existingUser) {
+      existingUser.role = 'super_admin';
+      if (params.fullName) existingUser.fullName = params.fullName.trim();
+      return sanitizeUser(existingUser);
+    }
+    const id = crypto.randomUUID();
+    const credits = params.initialCredits ?? 1000;
+    const created: StoredUser = {
+      id,
+      email: normalizedEmail,
+      fullName: params.fullName?.trim() || 'Platform Administrator',
+      role: 'super_admin',
+      language: 'en',
+      experienceMode: 'advanced',
+      memoryConsent: false,
+      activePlan: 'enterprise',
+      createdAt: new Date().toISOString(),
+      passwordHash: params.passwordHash || '',
+    };
+    this.store.users.set(id, created);
+    this.store.usersByEmail.set(normalizedEmail, id);
+    this.store.credits.set(id, { balance: credits, monthlyAllowance: credits });
+    this.store.creditLedger.unshift({
+      id: crypto.randomUUID(),
+      userId: id,
+      delta: credits,
+      balanceAfter: credits,
+      reason: 'Initial admin bootstrap credit grant',
+      referenceId: `bootstrap:${id}`,
+      createdAt: new Date().toISOString(),
+    });
+    return sanitizeUser(created);
   }
 
   async listUsersWithCredits(): Promise<Array<UserProfile & { creditBalance: number }>> {
