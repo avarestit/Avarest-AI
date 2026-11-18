@@ -1,5 +1,5 @@
 -- ============================================================================
--- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING
+-- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING (v2)
 -- Forward-only migration layered on top of 0001 and 0002.
 -- Target: Staging (wdbtszlcdliwacvztmjl). Never run directly on Production
 -- without staging verification and explicit release approval.
@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS public.credit_reservations (
   model_id TEXT,
   reserved_amount NUMERIC(14, 4) NOT NULL CHECK (reserved_amount > 0),
   actual_amount NUMERIC(14, 4) NOT NULL DEFAULT 0 CHECK (actual_amount >= 0),
+  uncollected_amount NUMERIC(14, 4) NOT NULL DEFAULT 0 CHECK (uncollected_amount >= 0),
   status TEXT NOT NULL DEFAULT 'reserved' CHECK (
     status IN ('reserved', 'finalized', 'released', 'expired')
   ),
@@ -91,6 +92,7 @@ BEGIN
     UPDATE public.credit_reservations
     SET status = 'expired',
         actual_amount = 0,
+        uncollected_amount = 0,
         released_at = NOW(),
         updated_at = NOW()
     WHERE id = v_res.id;
@@ -121,7 +123,7 @@ REVOKE ALL ON FUNCTION public._reconcile_user_expired_reservations(UUID, NUMERIC
   FROM PUBLIC, anon, authenticated;
 
 -- ----------------------------------------------------------------------------
--- 3. ATOMIC RESERVE CREDITS RPC (Service-Role Only, Idempotent, Row-Locked)
+-- 3. ATOMIC RESERVE CREDITS RPC (Service-Role Only, Expired Idempotency Handling)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.reserve_credits(
   p_user_id UUID,
@@ -187,6 +189,11 @@ BEGIN
     RAISE EXCEPTION 'Credit account not found';
   END IF;
 
+  -- Reconcile any expired reservations for this user before checking or reusing reservation keys
+  SELECT * INTO v_rec
+  FROM public._reconcile_user_expired_reservations(p_user_id, v_current, 100);
+  v_current := COALESCE(v_rec.next_balance, v_current);
+
   -- Idempotency check under account lock
   SELECT * INTO v_existing
   FROM public.credit_reservations cr
@@ -195,6 +202,8 @@ BEGIN
   FOR UPDATE;
 
   IF FOUND THEN
+    -- If the existing reservation was active but has expired, reconcile it above.
+    -- If status is now expired or terminal, return explicit deduplicated status so API returns 409 conflict.
     RETURN QUERY SELECT
       v_existing.id,
       v_existing.status,
@@ -205,11 +214,6 @@ BEGIN
       v_existing.expires_at;
     RETURN;
   END IF;
-
-  -- Reconcile any expired reservations for this user before checking available balance
-  SELECT * INTO v_rec
-  FROM public._reconcile_user_expired_reservations(p_user_id, v_current, 100);
-  v_current := COALESCE(v_rec.next_balance, v_current);
 
   IF v_current < v_reserve THEN
     RAISE EXCEPTION 'Insufficient credits';
@@ -235,6 +239,7 @@ BEGIN
     model_id,
     reserved_amount,
     actual_amount,
+    uncollected_amount,
     status,
     reason,
     expires_at
@@ -246,6 +251,7 @@ BEGIN
     p_provider_id,
     p_model_id,
     v_reserve,
+    0,
     0,
     'reserved',
     p_reason,
@@ -280,7 +286,7 @@ GRANT EXECUTE ON FUNCTION public.reserve_credits(UUID, NUMERIC, TEXT, TEXT, TEXT
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 4. ATOMIC FINALIZE RESERVATION RPC (Reconciles Actual Cost & Releases Unused)
+-- 4. ATOMIC FINALIZE RESERVATION RPC (Reconciles Actual Cost, Expiry Check & Overage Debt)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.finalize_credit_reservation(
   p_user_id UUID,
@@ -293,6 +299,7 @@ RETURNS TABLE (
   status TEXT,
   reserved_amount NUMERIC,
   actual_amount NUMERIC,
+  uncollected_amount NUMERIC,
   balance_after NUMERIC,
   deduplicated BOOLEAN
 )
@@ -309,7 +316,9 @@ DECLARE
   v_refund NUMERIC;
   v_extra_needed NUMERIC;
   v_collect NUMERIC;
+  v_uncollected NUMERIC := 0;
   v_settled_actual NUMERIC;
+  v_rec RECORD;
 BEGIN
   v_caller_role := COALESCE(auth.role(), '');
   IF v_caller_role <> 'service_role' AND CURRENT_USER NOT IN ('postgres', 'supabase_admin') THEN
@@ -333,6 +342,11 @@ BEGIN
     RAISE EXCEPTION 'Credit account not found';
   END IF;
 
+  -- Reconcile expired holds for this user first
+  SELECT * INTO v_rec
+  FROM public._reconcile_user_expired_reservations(p_user_id, v_current, 100);
+  v_current := COALESCE(v_rec.next_balance, v_current);
+
   SELECT * INTO v_res
   FROM public.credit_reservations cr
   WHERE cr.user_id = p_user_id
@@ -340,7 +354,7 @@ BEGIN
   FOR UPDATE;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'Credit reservation not found';
+    RAISE EXCEPTION 'RESERVATION_NOT_FOUND';
   END IF;
 
   IF v_res.status = 'finalized' THEN
@@ -349,13 +363,26 @@ BEGIN
       v_res.status,
       v_res.reserved_amount,
       v_res.actual_amount,
+      v_res.uncollected_amount,
       v_current,
       TRUE;
     RETURN;
   END IF;
 
+  -- If reservation has expired, it must not be finalized; ensure it is marked expired and raise RESERVATION_EXPIRED
+  IF v_res.status = 'reserved' AND v_res.expires_at <= NOW() THEN
+    UPDATE public.credit_reservations
+    SET status = 'expired',
+        actual_amount = 0,
+        uncollected_amount = 0,
+        released_at = NOW(),
+        updated_at = NOW()
+    WHERE id = v_res.id;
+    RAISE EXCEPTION 'RESERVATION_EXPIRED';
+  END IF;
+
   IF v_res.status IN ('released', 'expired') THEN
-    RAISE EXCEPTION 'Credit reservation is no longer active (status: %)', v_res.status;
+    RAISE EXCEPTION 'RESERVATION_NOT_ACTIVE:%', v_res.status;
   END IF;
 
   v_actual := ROUND(p_actual_amount, 4);
@@ -364,6 +391,7 @@ BEGIN
   IF v_actual <= v_res.reserved_amount THEN
     v_refund := ROUND(v_res.reserved_amount - v_actual, 4);
     v_settled_actual := v_actual;
+    v_uncollected := 0;
     IF v_refund > 0 THEN
       v_next := ROUND(v_current + v_refund, 4);
       UPDATE public.credit_accounts
@@ -385,6 +413,7 @@ BEGIN
     v_extra_needed := ROUND(v_actual - v_res.reserved_amount, 4);
     -- Never allow negative balance even if actual usage exceeds estimate
     v_collect := LEAST(v_current, v_extra_needed);
+    v_uncollected := ROUND(v_extra_needed - v_collect, 4);
     v_next := ROUND(v_current - v_collect, 4);
     v_settled_actual := ROUND(v_res.reserved_amount + v_collect, 4);
     IF v_collect > 0 THEN
@@ -408,6 +437,7 @@ BEGIN
   UPDATE public.credit_reservations
   SET status = 'finalized',
       actual_amount = v_settled_actual,
+      uncollected_amount = v_uncollected,
       finalized_at = NOW(),
       updated_at = NOW()
   WHERE id = v_res.id;
@@ -417,6 +447,7 @@ BEGIN
     'finalized'::TEXT,
     v_res.reserved_amount,
     v_settled_actual,
+    v_uncollected,
     v_next,
     FALSE;
 END;
@@ -478,7 +509,7 @@ BEGIN
   FOR UPDATE;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'Credit reservation not found';
+    RAISE EXCEPTION 'RESERVATION_NOT_FOUND';
   END IF;
 
   IF v_res.status IN ('released', 'expired', 'finalized') THEN
@@ -502,6 +533,7 @@ BEGIN
   UPDATE public.credit_reservations
   SET status = 'released',
       actual_amount = 0,
+      uncollected_amount = 0,
       released_at = NOW(),
       updated_at = NOW()
   WHERE id = v_res.id;
@@ -608,7 +640,85 @@ GRANT EXECUTE ON FUNCTION public.reconcile_expired_credit_reservations(UUID, INT
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 7. HARDEN COMPATIBILITY deduct_credits RPC (Strict service_role Only + Reconcile)
+-- 7. ATOMIC FIRST-ADMIN BOOTSTRAP RPC (Transaction Advisory Lock)
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.bootstrap_admin(
+  p_email TEXT,
+  p_full_name TEXT DEFAULT 'Platform Administrator',
+  p_initial_credits NUMERIC DEFAULT 1000
+)
+RETURNS TABLE (
+  user_id UUID,
+  email TEXT,
+  full_name TEXT,
+  role TEXT,
+  created_at TIMESTAMPTZ,
+  is_created BOOLEAN
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_caller_role TEXT;
+  v_admin_count INTEGER;
+  v_target_id UUID;
+  v_is_created BOOLEAN := FALSE;
+BEGIN
+  v_caller_role := COALESCE(auth.role(), '');
+  IF v_caller_role <> 'service_role' AND CURRENT_USER NOT IN ('postgres', 'supabase_admin') THEN
+    RAISE EXCEPTION 'Forbidden: bootstrap_admin requires service_role authorization';
+  END IF;
+
+  PERFORM pg_advisory_xact_lock(hashtext('avarest_admin_bootstrap_lock'));
+
+  SELECT COUNT(*)::INTEGER INTO v_admin_count
+  FROM public.profiles
+  WHERE role IN ('admin', 'super_admin');
+
+  IF v_admin_count > 0 THEN
+    RAISE EXCEPTION 'ADMIN_ALREADY_EXISTS';
+  END IF;
+
+  SELECT id INTO v_target_id
+  FROM public.profiles
+  WHERE email = LOWER(TRIM(p_email));
+
+  IF FOUND THEN
+    UPDATE public.profiles
+    SET role = 'super_admin',
+        full_name = COALESCE(NULLIF(TRIM(p_full_name), ''), full_name),
+        updated_at = NOW()
+    WHERE id = v_target_id;
+  ELSE
+    v_target_id := gen_random_uuid();
+    v_is_created := TRUE;
+    INSERT INTO public.profiles (id, email, full_name, role, active_plan, created_at, updated_at)
+    VALUES (v_target_id, LOWER(TRIM(p_email)), COALESCE(NULLIF(TRIM(p_full_name), ''), 'Platform Administrator'), 'super_admin', 'enterprise', NOW(), NOW());
+
+    INSERT INTO public.credit_accounts (user_id, balance, monthly_allowance)
+    VALUES (v_target_id, p_initial_credits, p_initial_credits)
+    ON CONFLICT (user_id) DO NOTHING;
+
+    INSERT INTO public.credit_ledger (user_id, delta, balance_after, reason, reference_id)
+    VALUES (v_target_id, p_initial_credits, p_initial_credits, 'Initial admin bootstrap credit grant', 'bootstrap:' || v_target_id)
+    ON CONFLICT (user_id, reference_id) WHERE reference_id IS NOT NULL DO NOTHING;
+  END IF;
+
+  RETURN QUERY
+  SELECT p.id, p.email, p.full_name, p.role, p.created_at, v_is_created
+  FROM public.profiles p
+  WHERE p.id = v_target_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.bootstrap_admin(TEXT, TEXT, NUMERIC)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.bootstrap_admin(TEXT, TEXT, NUMERIC)
+  TO service_role;
+
+-- ----------------------------------------------------------------------------
+-- 8. HARDEN COMPATIBILITY deduct_credits RPC (Strict service_role Only + Reconcile)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.deduct_credits(
   p_user_id UUID,

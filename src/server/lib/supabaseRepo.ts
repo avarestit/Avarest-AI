@@ -259,25 +259,50 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
     const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
     if (!row) throw new Error('EMPTY_FINALIZE_CREDITS_RESPONSE');
 
+    const { data: resRow } = await this.db
+      .from('credit_reservations')
+      .select('*')
+      .eq('user_id', params.userId)
+      .eq('reference_id', params.referenceId)
+      .maybeSingle();
+
     const nowIso = new Date().toISOString();
     return {
-      reservation: {
-        id: String(row.reservation_id),
-        userId: params.userId,
-        referenceId: params.referenceId,
-        feature: 'chat',
-        providerId: null,
-        modelId: null,
-        reservedAmount: Number(row.reserved_amount ?? 0),
-        actualAmount: Number(row.actual_amount ?? params.actualAmount),
-        status: (row.status as CreditReservation['status']) || 'finalized',
-        reason: params.reason || '',
-        expiresAt: nowIso,
-        finalizedAt: nowIso,
-        releasedAt: null,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      },
+      reservation: resRow
+        ? {
+            id: String(resRow.id),
+            userId: String(resRow.user_id),
+            referenceId: String(resRow.reference_id),
+            feature: (resRow.feature as CreditExecutionFeature) || 'chat',
+            providerId: (resRow.provider_id as ProviderId) || null,
+            modelId: String(resRow.model_id || '') || null,
+            reservedAmount: Number(resRow.reserved_amount ?? row.reserved_amount ?? 0),
+            actualAmount: Number(resRow.actual_amount ?? row.actual_amount ?? params.actualAmount),
+            status: (resRow.status as CreditReservation['status']) || 'finalized',
+            reason: String(resRow.reason || params.reason || ''),
+            expiresAt: String(resRow.expires_at || nowIso),
+            finalizedAt: resRow.finalized_at ? String(resRow.finalized_at) : nowIso,
+            releasedAt: resRow.released_at ? String(resRow.released_at) : null,
+            createdAt: String(resRow.created_at || nowIso),
+            updatedAt: String(resRow.updated_at || nowIso),
+          }
+        : {
+            id: String(row.reservation_id),
+            userId: params.userId,
+            referenceId: params.referenceId,
+            feature: 'chat',
+            providerId: null,
+            modelId: null,
+            reservedAmount: Number(row.reserved_amount ?? 0),
+            actualAmount: Number(row.actual_amount ?? params.actualAmount),
+            status: (row.status as CreditReservation['status']) || 'finalized',
+            reason: params.reason || '',
+            expiresAt: nowIso,
+            finalizedAt: nowIso,
+            releasedAt: null,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          },
       balanceAfter: Number(row.balance_after ?? 0),
       deduplicated: Boolean(row.deduplicated),
     };
@@ -298,25 +323,50 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
     const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
     if (!row) throw new Error('EMPTY_RELEASE_CREDITS_RESPONSE');
 
+    const { data: resRow } = await this.db
+      .from('credit_reservations')
+      .select('*')
+      .eq('user_id', params.userId)
+      .eq('reference_id', params.referenceId)
+      .maybeSingle();
+
     const nowIso = new Date().toISOString();
     return {
-      reservation: {
-        id: String(row.reservation_id),
-        userId: params.userId,
-        referenceId: params.referenceId,
-        feature: 'chat',
-        providerId: null,
-        modelId: null,
-        reservedAmount: Number(row.reserved_amount ?? 0),
-        actualAmount: 0,
-        status: (row.status as CreditReservation['status']) || 'released',
-        reason: params.reason || '',
-        expiresAt: nowIso,
-        finalizedAt: null,
-        releasedAt: nowIso,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      },
+      reservation: resRow
+        ? {
+            id: String(resRow.id),
+            userId: String(resRow.user_id),
+            referenceId: String(resRow.reference_id),
+            feature: (resRow.feature as CreditExecutionFeature) || 'chat',
+            providerId: (resRow.provider_id as ProviderId) || null,
+            modelId: String(resRow.model_id || '') || null,
+            reservedAmount: Number(resRow.reserved_amount ?? row.reserved_amount ?? 0),
+            actualAmount: Number(resRow.actual_amount ?? 0),
+            status: (resRow.status as CreditReservation['status']) || 'released',
+            reason: String(resRow.reason || params.reason || ''),
+            expiresAt: String(resRow.expires_at || nowIso),
+            finalizedAt: resRow.finalized_at ? String(resRow.finalized_at) : null,
+            releasedAt: resRow.released_at ? String(resRow.released_at) : nowIso,
+            createdAt: String(resRow.created_at || nowIso),
+            updatedAt: String(resRow.updated_at || nowIso),
+          }
+        : {
+            id: String(row.reservation_id),
+            userId: params.userId,
+            referenceId: params.referenceId,
+            feature: 'chat',
+            providerId: null,
+            modelId: null,
+            reservedAmount: Number(row.reserved_amount ?? 0),
+            actualAmount: 0,
+            status: (row.status as CreditReservation['status']) || 'released',
+            reason: params.reason || '',
+            expiresAt: nowIso,
+            finalizedAt: null,
+            releasedAt: nowIso,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          },
       refundedAmount: Number(row.refunded_amount ?? 0),
       balanceAfter: Number(row.balance_after ?? 0),
       deduplicated: Boolean(row.deduplicated),
