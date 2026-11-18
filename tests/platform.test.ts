@@ -1429,6 +1429,677 @@ describe('Staging Supabase Auth Session Verification & Token Lifecycle', () => {
   });
 });
 
+describe('Staging Credit Reservation Lifecycle, Agent Accounting & Admin Security', () => {
+  async function setupStagingAppWithUser(options?: { initialBalance?: number; openAiFetch?: typeof fetch }) {
+    const store = createStore();
+    if (options?.openAiFetch) {
+      vi.stubGlobal('fetch', options.openAiFetch);
+    }
+    const app = createAvarestApiApp({
+      store,
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+        AUTH_SESSION_SECRET: 'test-secret-for-vitest-only-32-chars',
+        ADMIN_BOOTSTRAP_SECRET: 'bootstrap-secret-vitest-12345678',
+        OPENAI_API_KEY: 'sk-staging-test-key',
+      },
+    });
 
+    const reg = await app.request('/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: `user-${crypto.randomUUID()}@avarestai.com`,
+        password: 'StrongPassword#1234',
+        fullName: 'Credit Tester',
+      }),
+    });
+    const { token, user } = (await reg.json()) as { token: string; user: { id: string; email: string } };
+    if (options?.initialBalance !== undefined) {
+      store.credits.set(user.id, { balance: options.initialBalance, monthlyAllowance: 100 });
+    }
+    return { app, store, token, userId: user.id };
+  }
 
+  it('1. insufficient balance blocks provider execution across chat, research, coder, and immediate agents', async () => {
+    const providerFetch = vi.fn(async () => new Response('Should never be called', { status: 200 }));
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 0.05,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
 
+    const agentRes = await app.request('/api/v1/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        name: 'Immediate Blocked Agent',
+        category: 'coding',
+        instructions: 'Analyze code',
+        requireApproval: false,
+      }),
+    });
+    const agentId = ((await agentRes.json()) as { agent: { id: string } }).agent.id;
+
+    const chatRes = await app.request('/api/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ prompt: 'Hello', routingMode: 'auto' }),
+    });
+    expect(chatRes.status).toBe(402);
+
+    const streamRes = await app.request('/api/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ prompt: 'Hello stream', routingMode: 'auto', stream: true }),
+    });
+    expect(streamRes.status).toBe(402);
+
+    const researchRes = await app.request('/api/v1/research', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query: 'Analyze security architecture' }),
+    });
+    expect(researchRes.status).toBe(402);
+
+    const coderRes = await app.request('/api/v1/coder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ taskType: 'review', language: 'TypeScript', prompt: 'Review auth module' }),
+    });
+    expect(coderRes.status).toBe(402);
+
+    const agentRunRes = await app.request(`/api/v1/agents/${agentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputTask: 'Audit credits' }),
+    });
+    expect(agentRunRes.status).toBe(402);
+
+    expect(providerFetch).not.toHaveBeenCalled();
+    expect(store.credits.get(userId)?.balance).toBe(0.05);
+  });
+
+  it('2. two concurrent reservations cannot overspend the same account', async () => {
+    const providerFetch = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 20));
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'Concurrent ok' } }],
+          usage: { prompt_tokens: 100, completion_tokens: 100 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 0.7,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
+
+    // Each chat reserves ~0.503+ credits, so only 1 of 2 concurrent requests can reserve from 0.7
+    const [r1, r2] = await Promise.all([
+      app.request('/api/v1/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ prompt: 'Concurrent one', routingMode: 'auto' }),
+      }),
+      app.request('/api/v1/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ prompt: 'Concurrent two', routingMode: 'auto' }),
+      }),
+    ]);
+
+    const statuses = [r1.status, r2.status].sort();
+    expect(statuses).toEqual([200, 402]);
+    expect(providerFetch).toHaveBeenCalledTimes(1);
+    expect(store.credits.get(userId)!.balance).toBeGreaterThanOrEqual(0);
+    expect(store.credits.get(userId)!.balance).toBe(0.5);
+  });
+
+  it('3. duplicate reservation request is idempotent at repository and HTTP idempotency layers', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const store = createStore();
+    store.credits.set('u-idem', { balance: 10, monthlyAllowance: 100 });
+    const repo = new MemoryWorkspaceRepository(store);
+
+    const first = await repo.reserveCredits({
+      userId: 'u-idem',
+      amount: 2.5,
+      feature: 'chat',
+      reason: 'Chat test',
+      referenceId: 'req-idem-1',
+    });
+    expect(first.deduplicated).toBe(false);
+    expect(first.balanceAfter).toBe(7.5);
+
+    const second = await repo.reserveCredits({
+      userId: 'u-idem',
+      amount: 2.5,
+      feature: 'chat',
+      reason: 'Chat test',
+      referenceId: 'req-idem-1',
+    });
+    expect(second.deduplicated).toBe(true);
+    expect(second.balanceAfter).toBe(7.5);
+    expect(second.reservation.id).toBe(first.reservation.id);
+    expect(store.credits.get('u-idem')?.balance).toBe(7.5);
+
+    // HTTP-level Idempotency-Key replay cannot invoke provider or charge a second time
+    const providerFetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'Once' } }],
+          usage: { prompt_tokens: 50, completion_tokens: 50 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const { app, store: appStore, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
+    const firstHttp = await app.request('/api/v1/coder', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'Idempotency-Key': 'coder-retry-key-1',
+      },
+      body: JSON.stringify({ taskType: 'explain', language: 'TypeScript', prompt: 'Explain promises' }),
+    });
+    expect(firstHttp.status).toBe(200);
+
+    const replayHttp = await app.request('/api/v1/coder', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'Idempotency-Key': 'coder-retry-key-1',
+      },
+      body: JSON.stringify({ taskType: 'explain', language: 'TypeScript', prompt: 'Explain promises' }),
+    });
+    expect(replayHttp.status).toBe(409);
+    expect(providerFetch).toHaveBeenCalledTimes(1);
+    expect(appStore.credits.get(userId)?.balance).toBe(9.8);
+  });
+
+  it('4. duplicate finalization does not double-charge or double-refund', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const store = createStore();
+    store.credits.set('u-fin', { balance: 20, monthlyAllowance: 100 });
+    const repo = new MemoryWorkspaceRepository(store);
+
+    await repo.reserveCredits({
+      userId: 'u-fin',
+      amount: 4,
+      feature: 'research',
+      reason: 'Research',
+      referenceId: 'fin-ref-1',
+    });
+    expect(store.credits.get('u-fin')?.balance).toBe(16);
+
+    const fin1 = await repo.finalizeCreditReservation({
+      userId: 'u-fin',
+      referenceId: 'fin-ref-1',
+      actualAmount: 1.25,
+    });
+    expect(fin1.deduplicated).toBe(false);
+    expect(fin1.balanceAfter).toBe(18.75);
+    expect(fin1.reservation.status).toBe('finalized');
+    expect(fin1.reservation.actualAmount).toBe(1.25);
+
+    const fin2 = await repo.finalizeCreditReservation({
+      userId: 'u-fin',
+      referenceId: 'fin-ref-1',
+      actualAmount: 1.25,
+    });
+    expect(fin2.deduplicated).toBe(true);
+    expect(fin2.balanceAfter).toBe(18.75);
+    expect(store.credits.get('u-fin')?.balance).toBe(18.75);
+  });
+
+  it('5. provider failure releases the reservation completely across execution endpoints', async () => {
+    const failingFetch = vi.fn(async () => new Response('Upstream bad gateway', { status: 502 }));
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: failingFetch as unknown as typeof fetch,
+    });
+
+    const chatFail = await app.request('/api/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ prompt: 'Fail chat', routingMode: 'auto' }),
+    });
+    expect(chatFail.status).toBe(502);
+    expect(store.credits.get(userId)?.balance).toBe(10);
+
+    const researchFail = await app.request('/api/v1/research', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query: 'Fail research topic' }),
+    });
+    expect(researchFail.status).toBe(502);
+    expect(store.credits.get(userId)?.balance).toBe(10);
+
+    const coderFail = await app.request('/api/v1/coder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ taskType: 'debug', language: 'TypeScript', prompt: 'Fail coder' }),
+    });
+    expect(coderFail.status).toBe(502);
+    expect(store.credits.get(userId)?.balance).toBe(10);
+
+    const reservations = Array.from(store.creditReservations.values()).filter((r) => r.userId === userId);
+    expect(reservations).toHaveLength(3);
+    expect(reservations.every((r) => r.status === 'released' && r.actualAmount === 0)).toBe(true);
+  });
+
+  it('6. streaming cancellation releases reservation without charging credits', async () => {
+    const encoder = new TextEncoder();
+    const slowStreamFetch = vi.fn(async () => {
+      const stream = new ReadableStream({
+        async start(controller) {
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Partial "}}]}\n\n'));
+          await new Promise((r) => setTimeout(r, 40));
+          controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"tail"}}]}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    });
+
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: slowStreamFetch as unknown as typeof fetch,
+    });
+
+    const abortController = new AbortController();
+    const streamRes = await app.request(
+      '/api/v1/chat',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ prompt: 'Stream cancel test', routingMode: 'auto', stream: true }),
+        signal: abortController.signal,
+      },
+    );
+    expect(streamRes.status).toBe(200);
+    // Abort request and cancel stream reader immediately
+    abortController.abort();
+    await streamRes.body?.cancel();
+    await new Promise((r) => setTimeout(r, 60));
+
+    expect(store.credits.get(userId)?.balance).toBe(10);
+    const reservations = Array.from(store.creditReservations.values()).filter((r) => r.userId === userId);
+    expect(reservations).toHaveLength(1);
+    expect(reservations[0]?.status).toBe('released');
+  });
+
+  it('7. actual cost reconciliation returns unused reserved credits to user balance', async () => {
+    const providerFetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'Concise reply' } }],
+          usage: { prompt_tokens: 150, completion_tokens: 50 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
+
+    const res = await app.request('/api/v1/research', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ query: 'Compare relational lock strategies in PostgreSQL' }),
+    });
+    expect(res.status).toBe(201);
+    const json = (await res.json()) as { creditsCharged: number; balanceAfter: number };
+    // Actual tokens = 200 -> 0.2 raw, min research cost = 0.25 (while estimated reservation > 1.2)
+    expect(json.creditsCharged).toBe(0.25);
+    expect(json.balanceAfter).toBe(9.75);
+    expect(store.credits.get(userId)?.balance).toBe(9.75);
+
+    const resv = Array.from(store.creditReservations.values())[0];
+    expect(resv.status).toBe('finalized');
+    expect(resv.reservedAmount).toBeGreaterThan(0.25);
+    expect(resv.actualAmount).toBe(0.25);
+  });
+
+  it('8. AI Agent immediate and approval executions enforce credit reservation, reconciliation, and release on failure', async () => {
+    let callCount = 0;
+    const providerFetch = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 3) {
+        return new Response('Agent upstream outage', { status: 500 });
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: `Agent output #${callCount}` } }],
+          usage: { prompt_tokens: 200, completion_tokens: 150 }, // 0.35 credits
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+
+    const { app, store, token, userId } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
+
+    // A) Immediate agent execution deducts actual usage (0.35 credits)
+    const immAgentRes = await app.request('/api/v1/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        name: 'Immediate Agent',
+        category: 'coding',
+        instructions: 'Execute immediate task',
+        requireApproval: false,
+      }),
+    });
+    const immAgentId = ((await immAgentRes.json()) as { agent: { id: string } }).agent.id;
+    const immRunRes = await app.request(`/api/v1/agents/${immAgentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputTask: 'Generate schema summary' }),
+    });
+    expect(immRunRes.status).toBe(201);
+    const immRunJson = (await immRunRes.json()) as { run: { status: string } };
+    expect(immRunJson.run.status).toBe('completed');
+    expect(store.credits.get(userId)?.balance).toBe(9.65);
+
+    // B) Approval-gated agent execution reserves & settles on approve (another 0.35 credits)
+    const appAgentRes = await app.request('/api/v1/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        name: 'Approval Agent',
+        category: 'research',
+        instructions: 'Wait for approval',
+        requireApproval: true,
+      }),
+    });
+    const appAgentId = ((await appAgentRes.json()) as { agent: { id: string } }).agent.id;
+    const gatedRunRes = await app.request(`/api/v1/agents/${appAgentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputTask: 'Audit staged queries' }),
+    });
+    const gatedRun = (await gatedRunRes.json()) as { run: { pendingApproval: { id: string } } };
+
+    // Concurrent duplicate approve only executes once
+    const [approve1, approve2] = await Promise.all([
+      app.request(`/api/v1/agents/approvals/${gatedRun.run.pendingApproval.id}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ decision: 'approved' }),
+      }),
+      app.request(`/api/v1/agents/approvals/${gatedRun.run.pendingApproval.id}/decide`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ decision: 'approved' }),
+      }),
+    ]);
+    expect([approve1.status, approve2.status].sort()).toEqual([200, 400]);
+    expect(store.credits.get(userId)?.balance).toBe(9.3);
+
+    // C) Provider failure on immediate agent releases reservation cleanly
+    const failedImmRun = await app.request(`/api/v1/agents/${immAgentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputTask: 'Trigger outage' }),
+    });
+    expect(failedImmRun.status).toBe(201);
+    const failedJson = (await failedImmRun.json()) as { run: { status: string } };
+    expect(failedJson.run.status).toBe('failed');
+    expect(store.credits.get(userId)?.balance).toBe(9.3);
+
+    // D) Approval-gated agent blocked with 402 when balance drops below estimate before approve
+    const gatedRunRes2 = await app.request(`/api/v1/agents/${appAgentId}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ inputTask: 'Should fail 402 on approve' }),
+    });
+    const gatedRun2 = (await gatedRunRes2.json()) as { run: { pendingApproval: { id: string } } };
+    store.credits.set(userId, { balance: 0.05, monthlyAllowance: 100 });
+    const lowBalApprove = await app.request(`/api/v1/agents/approvals/${gatedRun2.run.pendingApproval.id}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ decision: 'approved' }),
+    });
+    expect(lowBalApprove.status).toBe(402);
+    expect(providerFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it('9. unauthorized users cannot access any /api/v1/admin/* route including /admin/credits/reconcile', async () => {
+    const { app, token, userId } = await setupStagingAppWithUser({ initialBalance: 50 });
+
+    const adminEndpoints: Array<{ method: string; path: string; body?: unknown }> = [
+      { method: 'GET', path: '/api/v1/admin/overview' },
+      { method: 'GET', path: '/api/v1/admin/provider-health' },
+      { method: 'GET', path: '/api/v1/admin/users' },
+      { method: 'PATCH', path: `/api/v1/admin/users/${userId}/role`, body: { role: 'super_admin' } },
+      { method: 'GET', path: '/api/v1/admin/audit-logs' },
+      { method: 'GET', path: '/api/v1/admin/flags' },
+      { method: 'PATCH', path: '/api/v1/admin/flags/streaming_chat', body: { enabled: false } },
+      { method: 'PATCH', path: '/api/v1/admin/policies/default', body: { active: false } },
+      { method: 'POST', path: '/api/v1/admin/credits/reconcile' },
+      { method: 'GET', path: '/api/v1/admin/bootstrap' },
+    ];
+
+    for (const ep of adminEndpoints) {
+      const unauth = await app.request(ep.path, {
+        method: ep.method,
+        ...(ep.body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(ep.body) } : {}),
+      });
+      expect(unauth.status).toBe(401);
+
+      const nonAdmin = await app.request(ep.path, {
+        method: ep.method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(ep.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(ep.body ? { body: JSON.stringify(ep.body) } : {}),
+      });
+      expect(nonAdmin.status).toBe(403);
+    }
+  });
+
+  it('10. admin bootstrap fails closed when countAdmins() encounters a database error', async () => {
+    // 1. SupabaseWorkspaceRepository.countAdmins() must throw on DB error instead of returning 0
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(JSON.stringify({ message: 'connection to postgres refused' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    );
+    const { SupabaseWorkspaceRepository } = await import('../src/server/lib/supabaseRepo.ts');
+    const supaRepo = new SupabaseWorkspaceRepository(SUPABASE_PROJECTS.staging.url, 'staging-service-role-key');
+    await expect(supaRepo.countAdmins()).rejects.toThrow();
+
+    // 2. /api/v1/admin/bootstrap returns 503 BOOTSTRAP_VERIFICATION_FAILED and refuses promotion
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const store = createStore();
+    const failingRepo = new MemoryWorkspaceRepository(store);
+    failingRepo.countAdmins = async () => {
+      throw new Error('relation "profiles" read timeout');
+    };
+
+    const app = createAvarestApiApp({
+      repoOverride: failingRepo,
+      bindingsOverride: {
+        AVAREST_ENVIRONMENT: 'staging',
+        AUTH_SESSION_SECRET: 'test-secret-for-vitest-only-32-chars',
+        ADMIN_BOOTSTRAP_SECRET: 'bootstrap-secret-vitest-12345678',
+      },
+    });
+
+    const res = await app.request('/api/v1/admin/bootstrap', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-bootstrap-secret': 'bootstrap-secret-vitest-12345678',
+      },
+      body: JSON.stringify({
+        email: 'attacker@avarestai.com',
+        password: 'StrongPassword#2026',
+        fullName: 'Attacker',
+      }),
+    });
+    expect(res.status).toBe(503);
+    const json = (await res.json()) as { error: { code: string } };
+    expect(json.error.code).toBe('BOOTSTRAP_VERIFICATION_FAILED');
+    expect(store.users.size).toBe(0);
+  });
+
+  it('11. User A cannot reserve, finalize, or release User B credits or reservations', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const store = createStore();
+    store.credits.set('user-a', { balance: 10, monthlyAllowance: 100 });
+    store.credits.set('user-b', { balance: 10, monthlyAllowance: 100 });
+    const repo = new MemoryWorkspaceRepository(store);
+
+    await repo.reserveCredits({
+      userId: 'user-b',
+      amount: 3,
+      feature: 'chat',
+      reason: 'User B chat',
+      referenceId: 'only-user-b-ref',
+    });
+    expect(store.credits.get('user-b')?.balance).toBe(7);
+
+    // User A attempting to finalize or release User B's reservation reference fails cleanly
+    await expect(
+      repo.finalizeCreditReservation({ userId: 'user-a', referenceId: 'only-user-b-ref', actualAmount: 0.1 }),
+    ).rejects.toThrow('RESERVATION_NOT_FOUND');
+    await expect(
+      repo.releaseCreditReservation({ userId: 'user-a', referenceId: 'only-user-b-ref' }),
+    ).rejects.toThrow('RESERVATION_NOT_FOUND');
+
+    // User B's reservation and balance remain completely unchanged
+    expect(store.credits.get('user-b')?.balance).toBe(7);
+    expect(store.credits.get('user-a')?.balance).toBe(10);
+
+    // API level: User A sending a forged userId in body only touches User A's own balance
+    const providerFetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { content: 'Isolated ok' } }],
+          usage: { prompt_tokens: 100, completion_tokens: 100 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    const { app, store: appStore, token: tokenA, userId: userA } = await setupStagingAppWithUser({
+      initialBalance: 10,
+      openAiFetch: providerFetch as unknown as typeof fetch,
+    });
+    const regB = await app.request('/api/v1/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: 'victim-b@avarestai.com', password: 'StrongPassword#1234', fullName: 'Victim B' }),
+    });
+    const userB = ((await regB.json()) as { user: { id: string } }).user.id;
+    appStore.credits.set(userB, { balance: 25, monthlyAllowance: 100 });
+
+    const chatRes = await app.request('/api/v1/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
+      body: JSON.stringify({ prompt: 'Hello', userId: userB }),
+    });
+    expect(chatRes.status).toBe(200);
+    expect(appStore.credits.get(userA)?.balance).toBe(9.8);
+    expect(appStore.credits.get(userB)?.balance).toBe(25);
+  });
+
+  it('12. expired reservations are safely reconciled and prevent double-refunds', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const store = createStore();
+    store.credits.set('u-exp', { balance: 10, monthlyAllowance: 100 });
+    const repo = new MemoryWorkspaceRepository(store);
+
+    const resv = await repo.reserveCredits({
+      userId: 'u-exp',
+      amount: 4.5,
+      feature: 'chat_stream',
+      reason: 'Abandoned stream',
+      referenceId: 'abandoned-stream-1',
+      ttlSeconds: 60,
+    });
+    expect(store.credits.get('u-exp')?.balance).toBe(5.5);
+
+    // Simulate Worker termination leaving reservation expired in the past
+    const storedResv = store.creditReservations.get(`u-exp::abandoned-stream-1`)!;
+    storedResv.expiresAt = new Date(Date.now() - 5_000).toISOString();
+
+    const sweep1 = await repo.reconcileExpiredReservations({ userId: 'u-exp' });
+    expect(sweep1.reconciledCount).toBe(1);
+    expect(sweep1.refundedTotal).toBe(4.5);
+    expect(store.credits.get('u-exp')?.balance).toBe(10);
+    expect(storedResv.status).toBe('expired');
+    expect(resv.reservation.id).toBe(storedResv.id);
+
+    // Re-running reconciliation is idempotent (0 refunded)
+    const sweep2 = await repo.reconcileExpiredReservations({ userId: 'u-exp' });
+    expect(sweep2.reconciledCount).toBe(0);
+    expect(sweep2.refundedTotal).toBe(0);
+    expect(store.credits.get('u-exp')?.balance).toBe(10);
+
+    // Next reservation attempt automatically reconciles any newly expired reservation first
+    await repo.reserveCredits({
+      userId: 'u-exp',
+      amount: 6,
+      feature: 'research',
+      reason: 'Abandoned research',
+      referenceId: 'abandoned-res-2',
+      ttlSeconds: 60,
+    });
+    expect(store.credits.get('u-exp')?.balance).toBe(4);
+    store.creditReservations.get(`u-exp::abandoned-res-2`)!.expiresAt = new Date(Date.now() - 1_000).toISOString();
+
+    // Balance is 4, new reservation wants 8 -> auto-reconciles expired 6 -> balance 10 -> reserves 8 -> 2 remaining
+    const recovered = await repo.reserveCredits({
+      userId: 'u-exp',
+      amount: 8,
+      feature: 'coder',
+      reason: 'Follow-up coder',
+      referenceId: 'recovered-res-3',
+    });
+    expect(recovered.balanceAfter).toBe(2);
+    expect(store.creditReservations.get(`u-exp::abandoned-res-2`)?.status).toBe('expired');
+  });
+
+  it('13. verifies 0003_credit_reservations_and_admin_hardening.sql schema, constraints, RLS, and RPC security', () => {
+    const sqlPath = path.resolve(
+      process.cwd(),
+      'supabase/migrations/0003_credit_reservations_and_admin_hardening.sql',
+    );
+    const sql = fs.readFileSync(sqlPath, 'utf-8');
+
+    expect(sql).toContain('CREATE TABLE IF NOT EXISTS public.credit_reservations');
+    expect(sql).toContain('uq_credit_reservations_user_ref UNIQUE (user_id, reference_id)');
+    expect(sql).toContain("status IN ('reserved', 'finalized', 'released', 'expired')");
+    expect(sql).toContain('ALTER TABLE public.credit_reservations ENABLE ROW LEVEL SECURITY');
+    expect(sql).toContain('credit_reservations_owner_or_admin_select');
+    expect(sql).toContain('REVOKE INSERT, UPDATE, DELETE ON public.credit_reservations FROM anon, authenticated');
+    expect(sql).toContain("SET search_path = ''");
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.reserve_credits');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.finalize_credit_reservation');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.release_credit_reservation');
+    expect(sql).toContain('CREATE OR REPLACE FUNCTION public.reconcile_expired_credit_reservations');
+    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.reserve_credits');
+    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.finalize_credit_reservation');
+    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.release_credit_reservation');
+    expect(sql).toContain('GRANT EXECUTE ON FUNCTION public.reconcile_expired_credit_reservations');
+    expect(sql).toContain('TO service_role');
+    expect(sql).toContain('FOR UPDATE');
+  });
+});

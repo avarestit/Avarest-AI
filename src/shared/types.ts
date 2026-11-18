@@ -203,6 +203,34 @@ export interface CreditLedgerEntry {
   createdAt: string;
 }
 
+export type CreditExecutionFeature =
+  | 'chat'
+  | 'chat_stream'
+  | 'research'
+  | 'coder'
+  | 'agent_immediate'
+  | 'agent_approval';
+
+export type CreditReservationStatus = 'reserved' | 'finalized' | 'released' | 'expired';
+
+export interface CreditReservation {
+  id: string;
+  userId: string;
+  referenceId: string;
+  feature: CreditExecutionFeature;
+  providerId: ProviderId | null;
+  modelId: string | null;
+  reservedAmount: number;
+  actualAmount: number;
+  status: CreditReservationStatus;
+  reason: string;
+  expiresAt: string;
+  finalizedAt: string | null;
+  releasedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface UsageSummary {
   balance: number;
   monthlyAllowance: number;

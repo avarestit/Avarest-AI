@@ -5,9 +5,12 @@ import type {
   AgentRun,
   ChatMessage,
   Conversation,
+  CreditExecutionFeature,
+  CreditReservation,
   KnowledgeChunkMatch,
   KnowledgeDocument,
   Project,
+  ProviderId,
   ResearchReport,
   RoutingLog,
   UsageSummary,
@@ -139,8 +142,10 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
       .from('profiles')
       .select('id', { count: 'exact', head: true })
       .in('role', ['admin', 'super_admin']);
-    if (error) return 0;
-    return count ?? 0;
+    if (error || count === null) {
+      throw new Error(error?.message || 'ADMIN_COUNT_QUERY_FAILED');
+    }
+    return count;
   }
 
   async updateUserRole(userId: string, role: UserRole): Promise<UserProfile | null> {
@@ -168,8 +173,197 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
   }
 
   async getCreditBalance(userId: string): Promise<number> {
-    const { data } = await this.db.from('credit_accounts').select('balance').eq('user_id', userId).maybeSingle();
+    const { data, error } = await this.db
+      .from('credit_accounts')
+      .select('balance')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (error) {
+      throw new Error(error.message);
+    }
     return Number(data?.balance ?? 0);
+  }
+
+  private mapRpcError(error: { message: string }): Error {
+    const lower = error.message.toLowerCase();
+    if (lower.includes('insufficient')) return new Error('INSUFFICIENT_CREDITS');
+    if (lower.includes('not found')) return new Error('RESERVATION_NOT_FOUND');
+    if (lower.includes('forbidden')) return new Error('FORBIDDEN');
+    if (lower.includes('no longer active')) return new Error('RESERVATION_NOT_ACTIVE');
+    return new Error(error.message);
+  }
+
+  async reserveCredits(params: {
+    userId: string;
+    amount: number;
+    feature: CreditExecutionFeature;
+    reason: string;
+    referenceId: string;
+    ttlSeconds?: number;
+    providerId?: ProviderId;
+    modelId?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }> {
+    const { data, error } = await this.db.rpc('reserve_credits', {
+      p_user_id: params.userId,
+      p_amount: params.amount,
+      p_feature: params.feature,
+      p_reason: params.reason,
+      p_reference_id: params.referenceId,
+      p_ttl_seconds: params.ttlSeconds ?? 300,
+      p_provider_id: params.providerId ?? null,
+      p_model_id: params.modelId ?? null,
+    });
+    if (error) throw this.mapRpcError(error);
+
+    const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
+    if (!row) throw new Error('EMPTY_RESERVE_CREDITS_RESPONSE');
+
+    const nowIso = new Date().toISOString();
+    return {
+      reservation: {
+        id: String(row.reservation_id),
+        userId: params.userId,
+        referenceId: params.referenceId,
+        feature: params.feature,
+        providerId: params.providerId ?? null,
+        modelId: params.modelId ?? null,
+        reservedAmount: Number(row.reserved_amount ?? params.amount),
+        actualAmount: Number(row.actual_amount ?? 0),
+        status: (row.status as CreditReservation['status']) || 'reserved',
+        reason: params.reason,
+        expiresAt: String(row.expires_at ?? nowIso),
+        finalizedAt: null,
+        releasedAt: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      balanceAfter: Number(row.balance_after ?? 0),
+      deduplicated: Boolean(row.deduplicated),
+    };
+  }
+
+  async finalizeCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    actualAmount: number;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }> {
+    const { data, error } = await this.db.rpc('finalize_credit_reservation', {
+      p_user_id: params.userId,
+      p_reference_id: params.referenceId,
+      p_actual_amount: params.actualAmount,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw this.mapRpcError(error);
+
+    const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
+    if (!row) throw new Error('EMPTY_FINALIZE_CREDITS_RESPONSE');
+
+    const nowIso = new Date().toISOString();
+    return {
+      reservation: {
+        id: String(row.reservation_id),
+        userId: params.userId,
+        referenceId: params.referenceId,
+        feature: 'chat',
+        providerId: null,
+        modelId: null,
+        reservedAmount: Number(row.reserved_amount ?? 0),
+        actualAmount: Number(row.actual_amount ?? params.actualAmount),
+        status: (row.status as CreditReservation['status']) || 'finalized',
+        reason: params.reason || '',
+        expiresAt: nowIso,
+        finalizedAt: nowIso,
+        releasedAt: null,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      balanceAfter: Number(row.balance_after ?? 0),
+      deduplicated: Boolean(row.deduplicated),
+    };
+  }
+
+  async releaseCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; refundedAmount: number; balanceAfter: number; deduplicated: boolean }> {
+    const { data, error } = await this.db.rpc('release_credit_reservation', {
+      p_user_id: params.userId,
+      p_reference_id: params.referenceId,
+      p_reason: params.reason ?? null,
+    });
+    if (error) throw this.mapRpcError(error);
+
+    const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
+    if (!row) throw new Error('EMPTY_RELEASE_CREDITS_RESPONSE');
+
+    const nowIso = new Date().toISOString();
+    return {
+      reservation: {
+        id: String(row.reservation_id),
+        userId: params.userId,
+        referenceId: params.referenceId,
+        feature: 'chat',
+        providerId: null,
+        modelId: null,
+        reservedAmount: Number(row.reserved_amount ?? 0),
+        actualAmount: 0,
+        status: (row.status as CreditReservation['status']) || 'released',
+        reason: params.reason || '',
+        expiresAt: nowIso,
+        finalizedAt: null,
+        releasedAt: nowIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      refundedAmount: Number(row.refunded_amount ?? 0),
+      balanceAfter: Number(row.balance_after ?? 0),
+      deduplicated: Boolean(row.deduplicated),
+    };
+  }
+
+  async reconcileExpiredReservations(params?: {
+    userId?: string;
+    limit?: number;
+  }): Promise<{ reconciledCount: number; refundedTotal: number }> {
+    const { data, error } = await this.db.rpc('reconcile_expired_credit_reservations', {
+      p_user_id: params?.userId ?? null,
+      p_limit: params?.limit ?? 100,
+    });
+    if (error) throw this.mapRpcError(error);
+
+    const row = (Array.isArray(data) ? data[0] : data) as Record<string, unknown> | undefined;
+    return {
+      reconciledCount: Number(row?.reconciled_count ?? 0),
+      refundedTotal: Number(row?.refunded_total ?? 0),
+    };
+  }
+
+  async listCreditReservations(userId: string, limit = 50): Promise<CreditReservation[]> {
+    const { data } = await this.db
+      .from('credit_reservations')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    return (data || []).map((r) => ({
+      id: String(r.id),
+      userId: String(r.user_id),
+      referenceId: String(r.reference_id),
+      feature: r.feature as CreditExecutionFeature,
+      providerId: (r.provider_id as ProviderId) || null,
+      modelId: r.model_id ? String(r.model_id) : null,
+      reservedAmount: Number(r.reserved_amount ?? 0),
+      actualAmount: Number(r.actual_amount ?? 0),
+      status: r.status as CreditReservation['status'],
+      reason: String(r.reason || ''),
+      expiresAt: String(r.expires_at),
+      finalizedAt: r.finalized_at ? String(r.finalized_at) : null,
+      releasedAt: r.released_at ? String(r.released_at) : null,
+      createdAt: String(r.created_at),
+      updatedAt: String(r.updated_at),
+    }));
   }
 
   async deductCredits(params: { userId: string; amount: number; reason: string; referenceId?: string }): Promise<number> {
@@ -180,10 +374,7 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
       p_ref: params.referenceId || null,
     });
     if (error) {
-      if (error.message.toLowerCase().includes('insufficient')) {
-        throw new Error('INSUFFICIENT_CREDITS');
-      }
-      throw new Error(error.message);
+      throw this.mapRpcError(error);
     }
     return Number(data ?? 0);
   }
@@ -686,13 +877,20 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
     };
   }
 
-  async resolveApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<AgentApproval | null> {
-    const { data } = await this.db
+  async resolveApproval(
+    approvalId: string,
+    decision: 'approved' | 'rejected',
+    userId?: string,
+  ): Promise<AgentApproval | null> {
+    let query = this.db
       .from('agent_approvals')
       .update({ decision, decided_at: new Date().toISOString() })
       .eq('id', approvalId)
-      .select('*')
-      .maybeSingle();
+      .eq('decision', 'pending');
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+    const { data } = await query.select('*').maybeSingle();
     if (!data) return null;
     return {
       id: String(data.id),

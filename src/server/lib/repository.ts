@@ -4,9 +4,12 @@ import type {
   AgentRun,
   ChatMessage,
   Conversation,
+  CreditExecutionFeature,
+  CreditReservation,
   KnowledgeChunkMatch,
   KnowledgeDocument,
   Project,
+  ProviderId,
   ResearchReport,
   RoutingLog,
   UsageSummary,
@@ -19,8 +22,12 @@ import {
   appendAuditLog,
   chunkTextDocument,
   deductCreditsAtomic,
+  finalizeCreditReservationAtomic,
   getUserUsageSummary,
   isAdminRole,
+  reconcileExpiredReservationsAtomic,
+  releaseCreditReservationAtomic,
+  reserveCreditsAtomic,
   sanitizeUser,
   searchUserChunks,
   type AuditLogEntry,
@@ -55,6 +62,32 @@ export interface WorkspaceRepository {
 
   // Credits & Usage
   getCreditBalance(userId: string): Promise<number>;
+  reserveCredits(params: {
+    userId: string;
+    amount: number;
+    feature: CreditExecutionFeature;
+    reason: string;
+    referenceId: string;
+    ttlSeconds?: number;
+    providerId?: ProviderId;
+    modelId?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }>;
+  finalizeCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    actualAmount: number;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }>;
+  releaseCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; refundedAmount: number; balanceAfter: number; deduplicated: boolean }>;
+  reconcileExpiredReservations(params?: {
+    userId?: string;
+    limit?: number;
+  }): Promise<{ reconciledCount: number; refundedTotal: number }>;
+  listCreditReservations(userId: string, limit?: number): Promise<CreditReservation[]>;
   deductCredits(params: { userId: string; amount: number; reason: string; referenceId?: string }): Promise<number>;
   recordUsage(entry: {
     userId: string;
@@ -109,7 +142,11 @@ export interface WorkspaceRepository {
   updateAgentRun(runId: string, patch: Partial<AgentRun>): Promise<AgentRun | null>;
   createApproval(approval: AgentApproval): Promise<AgentApproval>;
   getApproval(userId: string, approvalId: string): Promise<AgentApproval | null>;
-  resolveApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<AgentApproval | null>;
+  resolveApproval(
+    approvalId: string,
+    decision: 'approved' | 'rejected',
+    userId?: string,
+  ): Promise<AgentApproval | null>;
 
   // Research
   listResearchReports(userId: string): Promise<ResearchReport[]>;
@@ -232,7 +269,52 @@ export class MemoryWorkspaceRepository implements WorkspaceRepository {
   }
 
   async getCreditBalance(userId: string): Promise<number> {
+    reconcileExpiredReservationsAtomic(this.store, { userId });
     return this.store.credits.get(userId)?.balance ?? 0;
+  }
+
+  async reserveCredits(params: {
+    userId: string;
+    amount: number;
+    feature: CreditExecutionFeature;
+    reason: string;
+    referenceId: string;
+    ttlSeconds?: number;
+    providerId?: ProviderId;
+    modelId?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }> {
+    return reserveCreditsAtomic(this.store, params);
+  }
+
+  async finalizeCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    actualAmount: number;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; balanceAfter: number; deduplicated: boolean }> {
+    return finalizeCreditReservationAtomic(this.store, params);
+  }
+
+  async releaseCreditReservation(params: {
+    userId: string;
+    referenceId: string;
+    reason?: string;
+  }): Promise<{ reservation: CreditReservation; refundedAmount: number; balanceAfter: number; deduplicated: boolean }> {
+    return releaseCreditReservationAtomic(this.store, params);
+  }
+
+  async reconcileExpiredReservations(params?: {
+    userId?: string;
+    limit?: number;
+  }): Promise<{ reconciledCount: number; refundedTotal: number }> {
+    return reconcileExpiredReservationsAtomic(this.store, params);
+  }
+
+  async listCreditReservations(userId: string, limit = 50): Promise<CreditReservation[]> {
+    return Array.from(this.store.creditReservations.values())
+      .filter((r) => r.userId === userId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
   }
 
   async deductCredits(params: { userId: string; amount: number; reason: string; referenceId?: string }): Promise<number> {
@@ -451,9 +533,13 @@ export class MemoryWorkspaceRepository implements WorkspaceRepository {
     return ap && ap.userId === userId ? ap : null;
   }
 
-  async resolveApproval(approvalId: string, decision: 'approved' | 'rejected'): Promise<AgentApproval | null> {
+  async resolveApproval(
+    approvalId: string,
+    decision: 'approved' | 'rejected',
+    userId?: string,
+  ): Promise<AgentApproval | null> {
     const ap = this.store.agentApprovals.get(approvalId);
-    if (!ap) return null;
+    if (!ap || (userId && ap.userId !== userId) || ap.decision !== 'pending') return null;
     ap.decision = decision;
     ap.decidedAt = new Date().toISOString();
     return ap;

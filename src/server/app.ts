@@ -19,6 +19,12 @@ import {
 import { ACTIVE_PROVIDER_IDS, getModelRegistry, getProviderSummary } from './brain/registry.ts';
 import { BrainRoutingError, routeWithAvarestBrain } from './brain/router.ts';
 import { getServerConfig, type ServerBindings } from './env.ts';
+import {
+  calculateActualCreditCost,
+  DEFAULT_RESERVATION_TTL_SECONDS,
+  estimateReservationCredits,
+  normalizeIdempotencyKey,
+} from './lib/credits.ts';
 import { hashPassword, signSessionToken, timingSafeEqualStrings, verifyPassword } from './lib/crypto.ts';
 import { MemoryWorkspaceRepository, type WorkspaceRepository } from './lib/repository.ts';
 import { chunkTextDocument, defaultStore, sanitizeUser, type WorkspaceStore } from './lib/store.ts';
@@ -86,7 +92,7 @@ export function createAvarestApiApp(options?: {
       c.header('Access-Control-Allow-Origin', allowedOrigin);
       c.header('Vary', 'Origin');
       c.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
-      c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Bootstrap-Secret');
+      c.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Bootstrap-Secret, Idempotency-Key');
     }
     if (c.req.method === 'OPTIONS') {
       return c.body(null, allowedOrigin ? 204 : 403);
@@ -341,6 +347,22 @@ export function createAvarestApiApp(options?: {
     return c.json({ token, user: sanitizeUser(stored) });
   });
 
+  // Blanket RBAC guard for ALL /api/v1/admin/* routes (exempting only POST /api/v1/admin/bootstrap)
+  app.use('/api/v1/admin/*', async (c, next) => {
+    if (c.req.path === '/api/v1/admin/bootstrap' && c.req.method === 'POST') {
+      await next();
+      return;
+    }
+    return authenticateRequest(c, next);
+  });
+  app.use('/api/v1/admin/*', async (c, next) => {
+    if (c.req.path === '/api/v1/admin/bootstrap' && c.req.method === 'POST') {
+      await next();
+      return;
+    }
+    return requireAdmin(c, next);
+  });
+
   // Secure explicit First-Admin Bootstrap (only works with server-only ADMIN_BOOTSTRAP_SECRET when zero admins exist)
   const bootstrapSchema = z.object({
     email: z.string().email().max(200),
@@ -379,7 +401,31 @@ export function createAvarestApiApp(options?: {
       return c.json({ error: { code: 'FORBIDDEN', message: 'Invalid bootstrap secret.', requestId: c.get('requestId') } }, 403);
     }
 
-    const existingAdmins = await repo.countAdmins();
+    let existingAdmins: number;
+    try {
+      existingAdmins = await repo.countAdmins();
+    } catch (err) {
+      await repo
+        .appendAuditLog({
+          actorId: 'system',
+          action: 'admin.bootstrap.verification_failed',
+          resourceType: 'admin_bootstrap',
+          resourceId: null,
+          detail: `Blocked bootstrap because administrator count check failed: ${err instanceof Error ? err.message : 'database error'}`,
+        })
+        .catch(() => {});
+      return c.json(
+        {
+          error: {
+            code: 'BOOTSTRAP_VERIFICATION_FAILED',
+            message: 'Unable to verify existing administrator state. Bootstrap is blocked.',
+            requestId: c.get('requestId'),
+          },
+        },
+        503,
+      );
+    }
+
     if (existingAdmins > 0) {
       await repo.appendAuditLog({
         actorId: 'system',
@@ -687,15 +733,32 @@ export function createAvarestApiApp(options?: {
       .optional(),
   });
 
+  async function safeReleaseReservation(
+    repo: WorkspaceRepository,
+    userId: string,
+    referenceId: string,
+    reason: string,
+  ): Promise<void> {
+    try {
+      await repo.releaseCreditReservation({ userId, referenceId, reason });
+    } catch (releaseErr) {
+      console.error(
+        `[Avarest Credit Release Error] ref=${referenceId}:`,
+        releaseErr instanceof Error ? releaseErr.message : 'Unknown release error',
+      );
+    }
+  }
+
   app.post('/api/v1/chat', rateLimit(40, 60_000), async (c) => {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
     const repo = c.get('repo')!;
+    const requestId = c.get('requestId');
     const body = await c.req.json().catch(() => null);
     const parsed = chatSchema.safeParse(body);
     if (!parsed.success) {
       return c.json(
-        { error: { code: 'VALIDATION_ERROR', message: parsed.error.issues[0]?.message || 'Invalid chat request.', requestId: c.get('requestId') } },
+        { error: { code: 'VALIDATION_ERROR', message: parsed.error.issues[0]?.message || 'Invalid chat request.', requestId } },
         400,
       );
     }
@@ -708,12 +771,7 @@ export function createAvarestApiApp(options?: {
       );
     }
 
-    const currentBalance = await repo.getCreditBalance(user.id);
-    if (currentBalance < 0.1) {
-      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
-    }
-
-    // Ensure or create conversation owned by current user
+    // Load existing conversation if provided (before reserving credits)
     let conv: Conversation | null = null;
     let existingMessages: ChatMessage[] = [];
     if (parsed.data.conversationId) {
@@ -723,16 +781,9 @@ export function createAvarestApiApp(options?: {
       }
       conv = loaded;
       existingMessages = loaded.messages;
-    } else {
-      conv = await repo.createConversation(user.id, {
-        title: prompt.slice(0, 60) + (prompt.length > 60 ? '...' : ''),
-        projectId: parsed.data.projectId || null,
-        routingMode,
-        preferredModel: modelId || null,
-      });
     }
 
-    // Route via Avarest Brain
+    // Route via Avarest Brain prior to credit reservation
     const policies = await repo.listRoutingPolicies();
     const decision = routeWithAvarestBrain({
       prompt,
@@ -743,63 +794,138 @@ export function createAvarestApiApp(options?: {
       policies,
     });
 
-    // Build context: system instructions + project instructions + optional RAG + consent-based memories
-    const systemParts: string[] = [
-      'You are Avarest One, an AI workspace powered by Avarest Brain. Respond accurately, clearly, and concisely.',
-    ];
-    if (conv.projectId) {
-      const proj = await repo.getProject(user.id, conv.projectId);
-      if (proj && proj.instructions) {
-        systemParts.push(`Project instructions (${proj.name}):\n${proj.instructions}`);
-      }
-    }
-    if (user.memoryConsent) {
-      const userMems = await repo.listMemories(user.id);
-      if (userMems.length > 0) {
-        systemParts.push(
-          `Authorized user memory context:\n${userMems.slice(0, 10).map((m) => `- ${m.fact}`).join('\n')}`,
-        );
-      }
-    }
-    if (useKnowledge) {
-      const matches = await repo.searchKnowledgeChunks(user.id, prompt, 3);
-      if (matches.length > 0) {
-        systemParts.push(
-          `Retrieved workspace knowledge:\n${matches.map((m) => `[${m.fileName}#${m.chunkIndex}]: ${m.content}`).join('\n\n')}`,
-        );
-      }
-    }
-
     const fullUserText = attachment
       ? `${prompt}\n\n[Attached file: ${attachment.fileName}]\n${attachment.content}`
       : prompt;
+    const costTier = getModelRegistry(config).find((m) => m.id === decision.selectedModel)?.costTier;
+    const historyChars = existingMessages.slice(-14).map((m) => m.content).join('\n');
+    const feature = stream ? 'chat_stream' : 'chat';
+    const estimatedCredits = estimateReservationCredits({
+      feature,
+      promptText: `${historyChars}\n${fullUserText}`,
+      costTier,
+    });
 
-    const userMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      conversationId: conv.id,
-      role: 'user',
-      content: fullUserText,
-      inputTokens: 0,
-      outputTokens: 0,
-      citations: [],
-      createdAt: new Date().toISOString(),
-    };
-    await repo.addMessage(user.id, userMsg);
-
-    const providerMessages = [...existingMessages, userMsg]
-      .slice(-14)
-      .map((m) => ({ role: m.role, content: m.content }));
-    const startedAt = Date.now();
     const assistantMsgId = crypto.randomUUID();
+    const idemKey = normalizeIdempotencyKey(c.req.header('Idempotency-Key'));
+    const referenceId = idemKey ? `${feature}:${idemKey}` : `chat:${assistantMsgId}`;
+
+    let reserved;
+    try {
+      reserved = await repo.reserveCredits({
+        userId: user.id,
+        amount: estimatedCredits,
+        feature,
+        reason: `Chat (${decision.selectedModel})`,
+        referenceId,
+        ttlSeconds: DEFAULT_RESERVATION_TTL_SECONDS,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+        return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+      }
+      throw err;
+    }
+
+    if (reserved.deduplicated) {
+      const inProgress = reserved.reservation.status === 'reserved';
+      return c.json(
+        {
+          error: {
+            code: inProgress ? 'RESERVATION_IN_PROGRESS' : 'DUPLICATE_REQUEST',
+            message: inProgress
+              ? 'An identical chat request is already in progress.'
+              : 'This idempotency key has already been processed.',
+            requestId,
+          },
+        },
+        409,
+      );
+    }
+
+    let providerMessages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
+    let systemParts: string[];
+    let userMsg: ChatMessage;
+    let conversationId: string;
+
+    try {
+      if (!conv) {
+        conv = await repo.createConversation(user.id, {
+          title: prompt.slice(0, 60) + (prompt.length > 60 ? '...' : ''),
+          projectId: parsed.data.projectId || null,
+          routingMode,
+          preferredModel: modelId || null,
+        });
+      }
+      conversationId = conv.id;
+
+      // Build context: system instructions + project instructions + optional RAG + consent-based memories
+      systemParts = [
+        'You are Avarest One, an AI workspace powered by Avarest Brain. Respond accurately, clearly, and concisely.',
+      ];
+      if (conv.projectId) {
+        const proj = await repo.getProject(user.id, conv.projectId);
+        if (proj && proj.instructions) {
+          systemParts.push(`Project instructions (${proj.name}):\n${proj.instructions}`);
+        }
+      }
+      if (user.memoryConsent) {
+        const userMems = await repo.listMemories(user.id);
+        if (userMems.length > 0) {
+          systemParts.push(
+            `Authorized user memory context:\n${userMems.slice(0, 10).map((m) => `- ${m.fact}`).join('\n')}`,
+          );
+        }
+      }
+      if (useKnowledge) {
+        const matches = await repo.searchKnowledgeChunks(user.id, prompt, 3);
+        if (matches.length > 0) {
+          systemParts.push(
+            `Retrieved workspace knowledge:\n${matches.map((m) => `[${m.fileName}#${m.chunkIndex}]: ${m.content}`).join('\n\n')}`,
+          );
+        }
+      }
+
+      userMsg = {
+        id: crypto.randomUUID(),
+        conversationId,
+        role: 'user',
+        content: fullUserText,
+        inputTokens: 0,
+        outputTokens: 0,
+        citations: [],
+        createdAt: new Date().toISOString(),
+      };
+      await repo.addMessage(user.id, userMsg);
+
+      providerMessages = [...existingMessages, userMsg]
+        .slice(-14)
+        .map((m) => ({ role: m.role, content: m.content }));
+    } catch (err) {
+      await safeReleaseReservation(repo, user.id, referenceId, 'Chat setup failed before execution');
+      throw err;
+    }
+
+    const startedAt = Date.now();
 
     if (stream) {
       const encoder = new TextEncoder();
-      const conversationId = conv.id;
+      let settled = false;
+      let streamCanceled = false;
+
+      const releaseOnce = async (reason: string) => {
+        if (settled) return;
+        settled = true;
+        await safeReleaseReservation(repo, user.id, referenceId, reason);
+      };
+
       const bodyStream = new ReadableStream({
         async start(controller) {
           let closed = false;
           const safeEnqueue = (chunk: Uint8Array) => {
-            if (closed || c.req.raw.signal.aborted) return;
+            if (closed || streamCanceled || c.req.raw.signal.aborted) return;
             try {
               controller.enqueue(chunk);
             } catch {
@@ -834,7 +960,7 @@ export function createAvarestApiApp(options?: {
               config,
               signal: c.req.raw.signal,
             })) {
-              if (c.req.raw.signal.aborted) break;
+              if (c.req.raw.signal.aborted || streamCanceled) break;
               if (chunk.delta) {
                 sendEvent('delta', { delta: chunk.delta });
               }
@@ -843,9 +969,29 @@ export function createAvarestApiApp(options?: {
               }
             }
 
-            const text = finalResult?.text || '';
-            const inputTokens = finalResult?.inputTokens || 0;
-            const outputTokens = finalResult?.outputTokens || 0;
+            if (c.req.raw.signal.aborted || streamCanceled || !finalResult) {
+              await releaseOnce('Chat stream canceled or interrupted before completion');
+              await repo
+                .addRoutingLog({
+                  id: crypto.randomUUID(),
+                  userId: user.id,
+                  taskCategory: decision.taskCategory,
+                  selectedProvider: decision.selectedProvider,
+                  selectedModel: decision.selectedModel,
+                  reason: 'Stream canceled by client before completion',
+                  latencyMs: Date.now() - startedAt,
+                  fallbackUsed: decision.fallbackUsed,
+                  status: 'error',
+                  createdAt: new Date().toISOString(),
+                })
+                .catch(() => {});
+              safeClose();
+              return;
+            }
+
+            const text = finalResult.text || '';
+            const inputTokens = finalResult.inputTokens || 0;
+            const outputTokens = finalResult.outputTokens || 0;
             const assistantMsg: ChatMessage = {
               id: assistantMsgId,
               conversationId,
@@ -857,19 +1003,25 @@ export function createAvarestApiApp(options?: {
               routingReason: decision.reason,
               inputTokens,
               outputTokens,
-              usageIsEstimated: finalResult?.usageIsEstimated ?? true,
-              citations: finalResult?.citations || [],
+              usageIsEstimated: finalResult.usageIsEstimated ?? true,
+              citations: finalResult.citations || [],
               createdAt: new Date().toISOString(),
             };
             await repo.addMessage(user.id, assistantMsg);
 
-            const creditCost = Number(Math.max(0.1, (inputTokens + outputTokens) / 1000).toFixed(4));
-            await repo.deductCredits({
-              userId: user.id,
-              amount: creditCost,
-              reason: `Chat (${decision.selectedModel})`,
-              referenceId: assistantMsg.id,
+            const actualCost = calculateActualCreditCost({
+              feature: 'chat_stream',
+              inputTokens,
+              outputTokens,
             });
+            const finalized = await repo.finalizeCreditReservation({
+              userId: user.id,
+              referenceId,
+              actualAmount: actualCost,
+              reason: `Chat (${decision.selectedModel})`,
+            });
+            settled = true;
+
             await repo.recordUsage({
               userId: user.id,
               providerId: decision.selectedProvider,
@@ -877,7 +1029,7 @@ export function createAvarestApiApp(options?: {
               feature: 'chat',
               inputTokens,
               outputTokens,
-              creditsCharged: creditCost,
+              creditsCharged: finalized.reservation.actualAmount,
             });
             await repo.addRoutingLog({
               id: crypto.randomUUID(),
@@ -892,24 +1044,40 @@ export function createAvarestApiApp(options?: {
               createdAt: new Date().toISOString(),
             });
 
-            sendEvent('done', { message: assistantMsg, creditsCharged: creditCost });
+            sendEvent('done', {
+              message: assistantMsg,
+              creditsCharged: finalized.reservation.actualAmount,
+              balanceAfter: finalized.balanceAfter,
+            });
             safeClose();
           } catch (err) {
             const msg = err instanceof Error ? err.message : 'Streaming failed';
-            await repo.addRoutingLog({
-              id: crypto.randomUUID(),
-              userId: user.id,
-              taskCategory: decision.taskCategory,
-              selectedProvider: decision.selectedProvider,
-              selectedModel: decision.selectedModel,
-              reason: msg,
-              latencyMs: Date.now() - startedAt,
-              fallbackUsed: decision.fallbackUsed,
-              status: 'error',
-              createdAt: new Date().toISOString(),
-            });
+            await releaseOnce(`Chat stream error: ${msg}`);
+            await repo
+              .addRoutingLog({
+                id: crypto.randomUUID(),
+                userId: user.id,
+                taskCategory: decision.taskCategory,
+                selectedProvider: decision.selectedProvider,
+                selectedModel: decision.selectedModel,
+                reason: msg,
+                latencyMs: Date.now() - startedAt,
+                fallbackUsed: decision.fallbackUsed,
+                status: 'error',
+                createdAt: new Date().toISOString(),
+              })
+              .catch(() => {});
             sendEvent('error', { message: msg });
             safeClose();
+          }
+        },
+        cancel() {
+          streamCanceled = true;
+          const cleanupPromise = releaseOnce('Chat stream canceled by client');
+          try {
+            c.executionCtx?.waitUntil(cleanupPromise);
+          } catch {
+            // Ignored outside Cloudflare Worker ExecutionContext (e.g. Vitest/Node)
           }
         },
       });
@@ -923,68 +1091,84 @@ export function createAvarestApiApp(options?: {
       });
     }
 
-    // Non-streaming execution
-    const completion = await executeProviderCompletion({
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      messages: providerMessages,
-      systemInstruction: systemParts.join('\n\n'),
-      config,
-    });
+    // Non-streaming execution with atomic reservation -> finalize/release
+    try {
+      const completion = await executeProviderCompletion({
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        messages: providerMessages,
+        systemInstruction: systemParts.join('\n\n'),
+        config,
+      });
 
-    const assistantMsg: ChatMessage = {
-      id: assistantMsgId,
-      conversationId: conv.id,
-      role: 'assistant',
-      content: completion.text,
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      taskCategory: decision.taskCategory,
-      routingReason: decision.reason,
-      inputTokens: completion.inputTokens,
-      outputTokens: completion.outputTokens,
-      usageIsEstimated: completion.usageIsEstimated,
-      citations: completion.citations,
-      createdAt: new Date().toISOString(),
-    };
-    await repo.addMessage(user.id, assistantMsg);
+      const assistantMsg: ChatMessage = {
+        id: assistantMsgId,
+        conversationId,
+        role: 'assistant',
+        content: completion.text,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        taskCategory: decision.taskCategory,
+        routingReason: decision.reason,
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+        usageIsEstimated: completion.usageIsEstimated,
+        citations: completion.citations,
+        createdAt: new Date().toISOString(),
+      };
+      await repo.addMessage(user.id, assistantMsg);
 
-    const creditCost = Number(Math.max(0.1, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    await repo.deductCredits({
-      userId: user.id,
-      amount: creditCost,
-      reason: `Chat (${decision.selectedModel})`,
-      referenceId: assistantMsg.id,
-    });
-    await repo.recordUsage({
-      userId: user.id,
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      feature: 'chat',
-      inputTokens: completion.inputTokens,
-      outputTokens: completion.outputTokens,
-      creditsCharged: creditCost,
-    });
-    await repo.addRoutingLog({
-      id: crypto.randomUUID(),
-      userId: user.id,
-      taskCategory: decision.taskCategory,
-      selectedProvider: decision.selectedProvider,
-      selectedModel: decision.selectedModel,
-      reason: decision.reason,
-      latencyMs: Date.now() - startedAt,
-      fallbackUsed: decision.fallbackUsed,
-      status: decision.fallbackUsed ? 'fallback' : 'success',
-      createdAt: new Date().toISOString(),
-    });
+      const actualCost = calculateActualCreditCost({
+        feature: 'chat',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+      });
+      const finalized = await repo.finalizeCreditReservation({
+        userId: user.id,
+        referenceId,
+        actualAmount: actualCost,
+        reason: `Chat (${decision.selectedModel})`,
+      });
 
-    return c.json({
-      conversationId: conv.id,
-      decision,
-      userMessage: userMsg,
-      assistantMessage: assistantMsg,
-      creditsCharged: creditCost,
-    });
+      await repo.recordUsage({
+        userId: user.id,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        feature: 'chat',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+        creditsCharged: finalized.reservation.actualAmount,
+      });
+      await repo.addRoutingLog({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        taskCategory: decision.taskCategory,
+        selectedProvider: decision.selectedProvider,
+        selectedModel: decision.selectedModel,
+        reason: decision.reason,
+        latencyMs: Date.now() - startedAt,
+        fallbackUsed: decision.fallbackUsed,
+        status: decision.fallbackUsed ? 'fallback' : 'success',
+        createdAt: new Date().toISOString(),
+      });
+
+      return c.json({
+        conversationId,
+        decision,
+        userMessage: userMsg,
+        assistantMessage: assistantMsg,
+        creditsCharged: finalized.reservation.actualAmount,
+        balanceAfter: finalized.balanceAfter,
+      });
+    } catch (err) {
+      await safeReleaseReservation(
+        repo,
+        user.id,
+        referenceId,
+        err instanceof Error ? `Chat failed: ${err.message}` : 'Chat execution failed',
+      );
+      throw err;
+    }
   });
 
   // =========================================================================
@@ -1021,15 +1205,11 @@ export function createAvarestApiApp(options?: {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
     const repo = c.get('repo')!;
+    const requestId = c.get('requestId');
     const body = await c.req.json().catch(() => null);
     const parsed = researchSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Research query must be at least 3 characters.' } }, 400);
-    }
-
-    const currentBalance = await repo.getCreditBalance(user.id);
-    if (currentBalance < 0.25) {
-      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
     }
 
     const policies = await repo.listRoutingPolicies();
@@ -1042,47 +1222,106 @@ export function createAvarestApiApp(options?: {
       policies,
     });
 
-    const completion = await executeProviderCompletion({
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      enableWebSearch: decision.selectedProvider === 'gemini',
-      systemInstruction:
-        'You are the Avarest One Deep Research Analyst. Produce a structured research brief clearly separating verified facts/sources from analytical synthesis. Never fabricate URLs or citations.',
-      messages: [{ role: 'user', content: parsed.data.query }],
-      config,
-    });
-
-    const report: ResearchReport = {
-      id: crypto.randomUUID(),
-      userId: user.id,
-      query: parsed.data.query,
-      reportMarkdown: completion.text,
-      citations: completion.citations,
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      groundingActive: completion.groundingActive,
-      createdAt: new Date().toISOString(),
-    };
-    await repo.createResearchReport(report);
-
-    const cost = Number(Math.max(0.25, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    await repo.deductCredits({
-      userId: user.id,
-      amount: cost,
-      reason: `Deep Research (${decision.selectedModel})`,
-      referenceId: report.id,
-    });
-    await repo.recordUsage({
-      userId: user.id,
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
+    const costTier = getModelRegistry(config).find((m) => m.id === decision.selectedModel)?.costTier;
+    const estimatedCredits = estimateReservationCredits({
       feature: 'research',
-      inputTokens: completion.inputTokens,
-      outputTokens: completion.outputTokens,
-      creditsCharged: cost,
+      promptText: parsed.data.query,
+      costTier,
     });
+    const reportId = crypto.randomUUID();
+    const idemKey = normalizeIdempotencyKey(c.req.header('Idempotency-Key'));
+    const referenceId = idemKey ? `research:${idemKey}` : `research:${reportId}`;
 
-    return c.json({ report }, 201);
+    let reserved;
+    try {
+      reserved = await repo.reserveCredits({
+        userId: user.id,
+        amount: estimatedCredits,
+        feature: 'research',
+        reason: `Deep Research (${decision.selectedModel})`,
+        referenceId,
+        ttlSeconds: DEFAULT_RESERVATION_TTL_SECONDS,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+        return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+      }
+      throw err;
+    }
+
+    if (reserved.deduplicated) {
+      const inProgress = reserved.reservation.status === 'reserved';
+      return c.json(
+        {
+          error: {
+            code: inProgress ? 'RESERVATION_IN_PROGRESS' : 'DUPLICATE_REQUEST',
+            message: inProgress
+              ? 'An identical research request is already in progress.'
+              : 'This idempotency key has already been processed.',
+            requestId,
+          },
+        },
+        409,
+      );
+    }
+
+    try {
+      const completion = await executeProviderCompletion({
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        enableWebSearch: decision.selectedProvider === 'gemini',
+        systemInstruction:
+          'You are the Avarest One Deep Research Analyst. Produce a structured research brief clearly separating verified facts/sources from analytical synthesis. Never fabricate URLs or citations.',
+        messages: [{ role: 'user', content: parsed.data.query }],
+        config,
+      });
+
+      const report: ResearchReport = {
+        id: reportId,
+        userId: user.id,
+        query: parsed.data.query,
+        reportMarkdown: completion.text,
+        citations: completion.citations,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        groundingActive: completion.groundingActive,
+        createdAt: new Date().toISOString(),
+      };
+      await repo.createResearchReport(report);
+
+      const actualCost = calculateActualCreditCost({
+        feature: 'research',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+      });
+      const finalized = await repo.finalizeCreditReservation({
+        userId: user.id,
+        referenceId,
+        actualAmount: actualCost,
+        reason: `Deep Research (${decision.selectedModel})`,
+      });
+      await repo.recordUsage({
+        userId: user.id,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        feature: 'research',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+        creditsCharged: finalized.reservation.actualAmount,
+      });
+
+      return c.json({ report, creditsCharged: finalized.reservation.actualAmount, balanceAfter: finalized.balanceAfter }, 201);
+    } catch (err) {
+      await safeReleaseReservation(
+        repo,
+        user.id,
+        referenceId,
+        err instanceof Error ? `Research failed: ${err.message}` : 'Deep Research execution failed',
+      );
+      throw err;
+    }
   });
 
   // =========================================================================
@@ -1099,15 +1338,11 @@ export function createAvarestApiApp(options?: {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
     const repo = c.get('repo')!;
+    const requestId = c.get('requestId');
     const body = await c.req.json().catch(() => null);
     const parsed = coderSchema.safeParse(body);
     if (!parsed.success) {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Invalid AI Coder request.' } }, 400);
-    }
-
-    const currentBalance = await repo.getCreditBalance(user.id);
-    if (currentBalance < 0.2) {
-      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.' } }, 402);
     }
 
     const policies = await repo.listRoutingPolicies();
@@ -1127,43 +1362,103 @@ export function createAvarestApiApp(options?: {
       parsed.data.codeContext ? `\nCode Context:\n\`\`\`\n${parsed.data.codeContext}\n\`\`\`` : '',
     ].join('\n');
 
-    const completion = await executeProviderCompletion({
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
-      systemInstruction:
-        'You are Avarest One AI Coder. Provide clean, production-grade code, root-cause debugging, and safe patch proposals. External repository writes always require explicit human approval.',
-      messages: [{ role: 'user', content: composedPrompt }],
-      config,
-    });
-
-    const coderRefId = crypto.randomUUID();
-    const cost = Number(Math.max(0.2, (completion.inputTokens + completion.outputTokens) / 1000).toFixed(4));
-    await repo.deductCredits({
-      userId: user.id,
-      amount: cost,
-      reason: `AI Coder: ${parsed.data.taskType}`,
-      referenceId: coderRefId,
-    });
-    await repo.recordUsage({
-      userId: user.id,
-      providerId: decision.selectedProvider,
-      modelId: decision.selectedModel,
+    const costTier = getModelRegistry(config).find((m) => m.id === decision.selectedModel)?.costTier;
+    const estimatedCredits = estimateReservationCredits({
       feature: 'coder',
-      inputTokens: completion.inputTokens,
-      outputTokens: completion.outputTokens,
-      creditsCharged: cost,
+      promptText: composedPrompt,
+      costTier,
     });
+    const coderRefId = crypto.randomUUID();
+    const idemKey = normalizeIdempotencyKey(c.req.header('Idempotency-Key'));
+    const referenceId = idemKey ? `coder:${idemKey}` : `coder:${coderRefId}`;
 
-    return c.json({
-      output: completion.text,
-      decision,
-      requiresHumanApprovalForExternalWrite: true,
-      tokens: {
-        input: completion.inputTokens,
-        output: completion.outputTokens,
-        usageIsEstimated: completion.usageIsEstimated,
-      },
-    });
+    let reserved;
+    try {
+      reserved = await repo.reserveCredits({
+        userId: user.id,
+        amount: estimatedCredits,
+        feature: 'coder',
+        reason: `AI Coder: ${parsed.data.taskType}`,
+        referenceId,
+        ttlSeconds: DEFAULT_RESERVATION_TTL_SECONDS,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+        return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+      }
+      throw err;
+    }
+
+    if (reserved.deduplicated) {
+      const inProgress = reserved.reservation.status === 'reserved';
+      return c.json(
+        {
+          error: {
+            code: inProgress ? 'RESERVATION_IN_PROGRESS' : 'DUPLICATE_REQUEST',
+            message: inProgress
+              ? 'An identical AI Coder request is already in progress.'
+              : 'This idempotency key has already been processed.',
+            requestId,
+          },
+        },
+        409,
+      );
+    }
+
+    try {
+      const completion = await executeProviderCompletion({
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        systemInstruction:
+          'You are Avarest One AI Coder. Provide clean, production-grade code, root-cause debugging, and safe patch proposals. External repository writes always require explicit human approval.',
+        messages: [{ role: 'user', content: composedPrompt }],
+        config,
+      });
+
+      const actualCost = calculateActualCreditCost({
+        feature: 'coder',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+      });
+      const finalized = await repo.finalizeCreditReservation({
+        userId: user.id,
+        referenceId,
+        actualAmount: actualCost,
+        reason: `AI Coder: ${parsed.data.taskType}`,
+      });
+      await repo.recordUsage({
+        userId: user.id,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        feature: 'coder',
+        inputTokens: completion.inputTokens,
+        outputTokens: completion.outputTokens,
+        creditsCharged: finalized.reservation.actualAmount,
+      });
+
+      return c.json({
+        output: completion.text,
+        decision,
+        requiresHumanApprovalForExternalWrite: true,
+        creditsCharged: finalized.reservation.actualAmount,
+        balanceAfter: finalized.balanceAfter,
+        tokens: {
+          input: completion.inputTokens,
+          output: completion.outputTokens,
+          usageIsEstimated: completion.usageIsEstimated,
+        },
+      });
+    } catch (err) {
+      await safeReleaseReservation(
+        repo,
+        user.id,
+        referenceId,
+        err instanceof Error ? `AI Coder failed: ${err.message}` : 'AI Coder execution failed',
+      );
+      throw err;
+    }
   });
 
   // =========================================================================
@@ -1215,6 +1510,7 @@ export function createAvarestApiApp(options?: {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
     const repo = c.get('repo')!;
+    const requestId = c.get('requestId');
     const agentId = c.req.param('id') || '';
     const agent = await repo.getAgent(user.id, agentId);
     if (!agent) {
@@ -1228,21 +1524,22 @@ export function createAvarestApiApp(options?: {
     }
 
     const now = new Date().toISOString();
-    const run: AgentRun = {
-      id: crypto.randomUUID(),
-      agentId: agent.id,
-      agentName: agent.name,
-      userId: user.id,
-      inputTask,
-      status: agent.requireApproval ? 'awaiting_approval' : 'running',
-      outputSummary: null,
-      errorMessage: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await repo.createAgentRun(run);
+    const runId = crypto.randomUUID();
 
     if (agent.requireApproval) {
+      const run: AgentRun = {
+        id: runId,
+        agentId: agent.id,
+        agentName: agent.name,
+        userId: user.id,
+        inputTask,
+        status: 'awaiting_approval',
+        outputSummary: null,
+        errorMessage: null,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await repo.createAgentRun(run);
       const approval: AgentApproval = {
         id: crypto.randomUUID(),
         runId: run.id,
@@ -1257,14 +1554,75 @@ export function createAvarestApiApp(options?: {
       return c.json({ run: { ...run, pendingApproval: approval } }, 201);
     }
 
-    // Execute immediately if human approval checkpoint is disabled on agent
+    // Immediate execution requires atomic credit reservation BEFORE running AI provider
+    const policies = await repo.listRoutingPolicies();
+    const decision = routeWithAvarestBrain({
+      prompt: inputTask,
+      config,
+      mode: 'auto',
+      userPlan: user.activePlan,
+      policies,
+    });
+    const costTier = getModelRegistry(config).find((m) => m.id === decision.selectedModel)?.costTier;
+    const estimatedCredits = estimateReservationCredits({
+      feature: 'agent_immediate',
+      promptText: `${agent.instructions}\n${inputTask}`,
+      costTier,
+    });
+    const idemKey = normalizeIdempotencyKey(c.req.header('Idempotency-Key'));
+    const referenceId = idemKey ? `agent_immediate:${idemKey}` : `agent-run:${runId}`;
+
+    let reserved;
     try {
-      const decision = routeWithAvarestBrain({
-        prompt: inputTask,
-        config,
-        mode: 'auto',
-        userPlan: user.activePlan,
+      reserved = await repo.reserveCredits({
+        userId: user.id,
+        amount: estimatedCredits,
+        feature: 'agent_immediate',
+        reason: `Agent execution: ${agent.name}`,
+        referenceId,
+        ttlSeconds: DEFAULT_RESERVATION_TTL_SECONDS,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
       });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+        return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+      }
+      throw err;
+    }
+
+    if (reserved.deduplicated) {
+      const inProgress = reserved.reservation.status === 'reserved';
+      return c.json(
+        {
+          error: {
+            code: inProgress ? 'RESERVATION_IN_PROGRESS' : 'DUPLICATE_REQUEST',
+            message: inProgress
+              ? 'An identical agent execution is already in progress.'
+              : 'This idempotency key has already been processed.',
+            requestId,
+          },
+        },
+        409,
+      );
+    }
+
+    const run: AgentRun = {
+      id: runId,
+      agentId: agent.id,
+      agentName: agent.name,
+      userId: user.id,
+      inputTask,
+      status: 'running',
+      outputSummary: null,
+      errorMessage: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    await repo.createAgentRun(run);
+
+    const startedAt = Date.now();
+    try {
       const res = await executeProviderCompletion({
         providerId: decision.selectedProvider,
         modelId: decision.selectedModel,
@@ -1272,13 +1630,53 @@ export function createAvarestApiApp(options?: {
         messages: [{ role: 'user', content: inputTask }],
         config,
       });
+
+      const actualCost = calculateActualCreditCost({
+        feature: 'agent_immediate',
+        inputTokens: res.inputTokens,
+        outputTokens: res.outputTokens,
+      });
+      await repo.finalizeCreditReservation({
+        userId: user.id,
+        referenceId,
+        actualAmount: actualCost,
+        reason: `Agent execution: ${agent.name}`,
+      });
+      await repo.recordUsage({
+        userId: user.id,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        feature: 'agent_immediate',
+        inputTokens: res.inputTokens,
+        outputTokens: res.outputTokens,
+        creditsCharged: actualCost,
+      });
+      await repo.addRoutingLog({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        taskCategory: decision.taskCategory,
+        selectedProvider: decision.selectedProvider,
+        selectedModel: decision.selectedModel,
+        reason: decision.reason,
+        latencyMs: Date.now() - startedAt,
+        fallbackUsed: decision.fallbackUsed,
+        status: decision.fallbackUsed ? 'fallback' : 'success',
+        createdAt: new Date().toISOString(),
+      });
+
       run.status = 'completed';
       run.outputSummary = res.text;
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Agent execution failed';
+      await safeReleaseReservation(repo, user.id, referenceId, `Agent execution failed: ${msg}`);
       run.status = 'failed';
-      run.errorMessage = err instanceof Error ? err.message : 'Agent execution failed';
+      run.errorMessage = msg;
     }
-    const updated = await repo.updateAgentRun(run.id, { status: run.status, outputSummary: run.outputSummary, errorMessage: run.errorMessage });
+    const updated = await repo.updateAgentRun(run.id, {
+      status: run.status,
+      outputSummary: run.outputSummary,
+      errorMessage: run.errorMessage,
+    });
     return c.json({ run: updated || run }, 201);
   });
 
@@ -1286,6 +1684,7 @@ export function createAvarestApiApp(options?: {
     const user = c.get('currentUser');
     const config = c.get('serverConfig');
     const repo = c.get('repo')!;
+    const requestId = c.get('requestId');
     const approvalId = c.req.param('id') || '';
     const approval = await repo.getApproval(user.id, approvalId);
     if (!approval) {
@@ -1300,13 +1699,16 @@ export function createAvarestApiApp(options?: {
       return c.json({ error: { code: 'VALIDATION_ERROR', message: 'Decision must be "approved" or "rejected".' } }, 400);
     }
 
-    const resolvedApproval = await repo.resolveApproval(approval.id, body.decision);
     const run = await repo.getAgentRun(user.id, approval.runId);
     if (!run) {
       return c.json({ error: { code: 'NOT_FOUND', message: 'Associated run not found.' } }, 404);
     }
 
     if (body.decision === 'rejected') {
+      const resolvedApproval = await repo.resolveApproval(approval.id, 'rejected', user.id);
+      if (!resolvedApproval) {
+        return c.json({ error: { code: 'ALREADY_DECIDED', message: 'This approval was already resolved.' } }, 400);
+      }
       const updated = await repo.updateAgentRun(run.id, {
         status: 'canceled',
         outputSummary: 'Execution canceled at human approval checkpoint.',
@@ -1315,16 +1717,75 @@ export function createAvarestApiApp(options?: {
     }
 
     const agent = await repo.getAgent(user.id, run.agentId);
+    const policies = await repo.listRoutingPolicies();
+    const decision = routeWithAvarestBrain({
+      prompt: run.inputTask,
+      config,
+      mode: 'auto',
+      userPlan: user.activePlan,
+      policies,
+    });
+    const costTier = getModelRegistry(config).find((m) => m.id === decision.selectedModel)?.costTier;
+    const estimatedCredits = estimateReservationCredits({
+      feature: 'agent_approval',
+      promptText: `${agent?.instructions || ''}\n${run.inputTask}`,
+      costTier,
+    });
+
+    // Pre-check before claiming approval so insufficient balance preserves pending checkpoint
+    const currentBalance = await repo.getCreditBalance(user.id);
+    if (currentBalance < estimatedCredits) {
+      return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+    }
+
+    // Atomically claim pending -> approved so concurrent approvals cannot double-execute
+    const resolvedApproval = await repo.resolveApproval(approval.id, 'approved', user.id);
+    if (!resolvedApproval) {
+      return c.json({ error: { code: 'ALREADY_DECIDED', message: 'This approval was already resolved.' } }, 400);
+    }
+
+    const referenceId = `agent-approval:${run.id}`;
+    let reserved;
+    try {
+      reserved = await repo.reserveCredits({
+        userId: user.id,
+        amount: estimatedCredits,
+        feature: 'agent_approval',
+        reason: `Approved agent execution: ${run.agentName}`,
+        referenceId,
+        ttlSeconds: DEFAULT_RESERVATION_TTL_SECONDS,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
+        await repo.updateAgentRun(run.id, {
+          status: 'failed',
+          errorMessage: 'Insufficient workspace credits.',
+        });
+        return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
+      }
+      throw err;
+    }
+
+    if (reserved.deduplicated) {
+      return c.json(
+        {
+          error: {
+            code: 'ALREADY_DECIDED',
+            message: 'This agent approval run has already been reserved or executed.',
+            requestId,
+          },
+        },
+        409,
+      );
+    }
+
+    const startedAt = Date.now();
     let nextStatus: AgentRun['status'] = 'completed';
     let outputSummary: string | null = null;
     let errorMessage: string | null = null;
     try {
-      const decision = routeWithAvarestBrain({
-        prompt: run.inputTask,
-        config,
-        mode: 'auto',
-        userPlan: user.activePlan,
-      });
       const res = await executeProviderCompletion({
         providerId: decision.selectedProvider,
         modelId: decision.selectedModel,
@@ -1332,10 +1793,45 @@ export function createAvarestApiApp(options?: {
         messages: [{ role: 'user', content: run.inputTask }],
         config,
       });
+
+      const actualCost = calculateActualCreditCost({
+        feature: 'agent_approval',
+        inputTokens: res.inputTokens,
+        outputTokens: res.outputTokens,
+      });
+      await repo.finalizeCreditReservation({
+        userId: user.id,
+        referenceId,
+        actualAmount: actualCost,
+        reason: `Approved agent execution: ${run.agentName}`,
+      });
+      await repo.recordUsage({
+        userId: user.id,
+        providerId: decision.selectedProvider,
+        modelId: decision.selectedModel,
+        feature: 'agent_approval',
+        inputTokens: res.inputTokens,
+        outputTokens: res.outputTokens,
+        creditsCharged: actualCost,
+      });
+      await repo.addRoutingLog({
+        id: crypto.randomUUID(),
+        userId: user.id,
+        taskCategory: decision.taskCategory,
+        selectedProvider: decision.selectedProvider,
+        selectedModel: decision.selectedModel,
+        reason: decision.reason,
+        latencyMs: Date.now() - startedAt,
+        fallbackUsed: decision.fallbackUsed,
+        status: decision.fallbackUsed ? 'fallback' : 'success',
+        createdAt: new Date().toISOString(),
+      });
+
       outputSummary = res.text;
     } catch (err) {
       nextStatus = 'failed';
       errorMessage = err instanceof Error ? err.message : 'Agent execution failed';
+      await safeReleaseReservation(repo, user.id, referenceId, `Approved agent execution failed: ${errorMessage}`);
     }
     const updatedRun = await repo.updateAgentRun(run.id, { status: nextStatus, outputSummary, errorMessage });
     return c.json({ approval: resolvedApproval, run: updatedRun || run });
@@ -1527,14 +2023,22 @@ export function createAvarestApiApp(options?: {
   });
 
   // =========================================================================
-  // PROTECTED ADMIN CONSOLE (Strict Server-Side RBAC)
+  // PROTECTED ADMIN CONSOLE (Blanket Server-Side RBAC for /api/v1/admin/*)
   // =========================================================================
-  app.use('/api/v1/admin/overview', authenticateRequest, requireAdmin);
-  app.use('/api/v1/admin/provider-health', authenticateRequest, requireAdmin);
-  app.use('/api/v1/admin/users*', authenticateRequest, requireAdmin);
-  app.use('/api/v1/admin/audit-logs', authenticateRequest, requireAdmin);
-  app.use('/api/v1/admin/flags*', authenticateRequest, requireAdmin);
-  app.use('/api/v1/admin/policies*', authenticateRequest, requireAdmin);
+
+  app.post('/api/v1/admin/credits/reconcile', async (c) => {
+    const actor = c.get('currentUser');
+    const repo = c.get('repo')!;
+    const result = await repo.reconcileExpiredReservations({ limit: 250 });
+    await repo.appendAuditLog({
+      actorId: actor.id,
+      action: 'admin.credits.reconcile_expired',
+      resourceType: 'credit_reservation',
+      resourceId: null,
+      detail: `Reconciled ${result.reconciledCount} expired reservations (refunded ${result.refundedTotal} credits)`,
+    });
+    return c.json(result);
+  });
 
   app.get('/api/v1/admin/overview', async (c) => {
     const config = c.get('serverConfig');
