@@ -1214,5 +1214,221 @@ describe('Cloudflare Workers Global Scope & Production Secret Guardrails', () =>
   });
 });
 
+describe('Staging Supabase Auth Session Verification & Token Lifecycle', () => {
+  const STAGING_SUPABASE_BINDINGS = {
+    AVAREST_ENVIRONMENT: 'staging',
+    VITE_ENVIRONMENT: 'staging',
+    SUPABASE_URL: SUPABASE_PROJECTS.staging.url,
+    VITE_SUPABASE_URL: SUPABASE_PROJECTS.staging.url,
+    SUPABASE_SERVICE_ROLE_KEY: 'staging-service-role-test-key',
+    VITE_SUPABASE_ANON_KEY: 'staging-anon-test-key',
+  };
+
+  it('verifies a valid Staging Supabase JWT cleanly via /api/v1/auth/session and persists profile', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const repo = new MemoryWorkspaceRepository(createStore());
+    const validJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdXBhLXN0YWdpbmctdTEifQ.sig123';
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      expect(url).toBe(`${SUPABASE_PROJECTS.staging.url}/auth/v1/user`);
+      const headers = new Headers(init?.headers);
+      expect(headers.get('Authorization')).toBe(`Bearer ${validJwt}`);
+      expect(headers.get('apikey')).toBe('staging-service-role-test-key');
+      return new Response(
+        JSON.stringify({
+          id: 'supa-staging-u1',
+          email: 'staging.user@avarestai.com',
+          user_metadata: { full_name: 'Staging Tester' },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const app = createAvarestApiApp({
+      repoOverride: repo,
+      bindingsOverride: STAGING_SUPABASE_BINDINGS,
+    });
+
+    const sessionRes = await app.request('/api/v1/auth/session', {
+      headers: { Authorization: `Bearer ${validJwt}` },
+    });
+    expect(sessionRes.status).toBe(200);
+    const sessionJson = (await sessionRes.json()) as { user: { id: string; email: string; fullName: string } };
+    expect(sessionJson.user.id).toBe('supa-staging-u1');
+    expect(sessionJson.user.email).toBe('staging.user@avarestai.com');
+    expect(sessionJson.user.fullName).toBe('Staging Tester');
+
+    // Subsequent authenticated API call with same session succeeds
+    const projectsRes = await app.request('/api/v1/projects', {
+      headers: { Authorization: `Bearer ${validJwt}` },
+    });
+    expect(projectsRes.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects unauthenticated, malformed, and invalid/expired tokens with 401 rather than 502', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const repo = new MemoryWorkspaceRepository(createStore());
+
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ message: 'JWT expired' }), { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const app = createAvarestApiApp({
+      repoOverride: repo,
+      bindingsOverride: STAGING_SUPABASE_BINDINGS,
+    });
+
+    // Unauthenticated API access
+    const unauth = await app.request('/api/v1/auth/session');
+    expect(unauth.status).toBe(401);
+
+    // Malformed / non-ASCII / non-JWT token rejected before calling fetch() (prevents ByteString TypeError -> 502)
+    const malformed = await app.request('/api/v1/auth/session', {
+      headers: { Authorization: 'Bearer invalid-not-a-jwt' },
+    });
+    expect(malformed.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const nonAscii = await app.request('/api/v1/auth/session', {
+      headers: { Authorization: 'Bearer aaa.bbb.ccc\u00e9' },
+    });
+    expect(nonAscii.status).toBe(401);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Expired/invalid Supabase JWT returns 401 UNAUTHORIZED
+    const expiredJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjF9.expired';
+    const expiredRes = await app.request('/api/v1/auth/session', {
+      headers: { Authorization: `Bearer ${expiredJwt}` },
+    });
+    expect(expiredRes.status).toBe(401);
+    const expiredJson = (await expiredRes.json()) as { error: { code: string } };
+    expect(expiredJson.error.code).toBe('UNAUTHORIZED');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not misreport profile DB failures or downstream route errors as "Unable to verify session with Supabase Auth."', async () => {
+    const { MemoryWorkspaceRepository } = await import('../src/server/lib/repository.ts');
+    const validJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzdXBhLXN0YWdpbmctdTIifQ.sig456';
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            id: 'supa-staging-u2',
+            email: 'dbcheck@avarestai.com',
+            user_metadata: { full_name: 'DB Check' },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      ),
+    );
+
+    // 1. Profile DB upsert failure must return 503 PROFILE_SYNC_ERROR, not 502 AUTH_UPSTREAM_ERROR
+    const failingProfileRepo = new MemoryWorkspaceRepository(createStore());
+    failingProfileRepo.upsertProfileFromSupabaseAuth = async () => {
+      throw new Error('duplicate key value violates unique constraint');
+    };
+    const appProfileFail = createAvarestApiApp({
+      repoOverride: failingProfileRepo,
+      bindingsOverride: STAGING_SUPABASE_BINDINGS,
+    });
+    const profileErrRes = await appProfileFail.request('/api/v1/auth/session', {
+      headers: { Authorization: `Bearer ${validJwt}` },
+    });
+    expect(profileErrRes.status).toBe(503);
+    const profileErrJson = (await profileErrRes.json()) as { error: { code: string; message: string } };
+    expect(profileErrJson.error.code).toBe('PROFILE_SYNC_ERROR');
+    expect(profileErrJson.error.message).not.toContain('Unable to verify session with Supabase Auth');
+
+    // 2. Downstream route exception must hit Hono onError (500 INTERNAL_ERROR), never auth middleware catch (502)
+    const failingRouteRepo = new MemoryWorkspaceRepository(createStore());
+    failingRouteRepo.listProjects = async () => {
+      throw new Error('Transient downstream query error');
+    };
+    const appRouteFail = createAvarestApiApp({
+      repoOverride: failingRouteRepo,
+      bindingsOverride: STAGING_SUPABASE_BINDINGS,
+    });
+    const routeErrRes = await appRouteFail.request('/api/v1/projects', {
+      headers: { Authorization: `Bearer ${validJwt}` },
+    });
+    expect(routeErrRes.status).toBe(500);
+    const routeErrJson = (await routeErrRes.json()) as { error: { code: string; message: string } };
+    expect(routeErrJson.error.code).toBe('INTERNAL_ERROR');
+    expect(routeErrJson.error.message).not.toContain('Unable to verify session with Supabase Auth');
+  });
+
+  it('restores, refreshes expiring tokens, clears stale localStorage on logout/empty session', async () => {
+    const storageMap = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => storageMap.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        storageMap.set(k, v);
+      },
+      removeItem: (k: string) => {
+        storageMap.delete(k);
+      },
+    });
+
+    vi.resetModules();
+
+    // Case A: Stale localStorage token is purged when Supabase has no active session (e.g. after logout or expiry)
+    vi.doMock('../src/lib/supabaseClient.ts', () => ({
+      getPublicSupabaseClient: () => ({
+        auth: {
+          getSession: async () => ({ data: { session: null }, error: null }),
+          refreshSession: async () => ({ data: { session: null }, error: null }),
+        },
+      }),
+    }));
+    const apiModA = await import('../src/lib/api.ts');
+    apiModA.setStoredToken('stale-old-token-in-localstorage');
+    expect(await apiModA.resolveActiveAuthToken()).toBeNull();
+    expect(apiModA.getStoredToken()).toBeNull();
+
+    // Case B: Active session expiring within 10s automatically refreshes and persists the new access token
+    vi.resetModules();
+    const refreshMock = vi.fn(async () => ({
+      data: {
+        session: {
+          access_token: 'fresh-refreshed-jwt.payload.sig',
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+        },
+      },
+      error: null,
+    }));
+    vi.doMock('../src/lib/supabaseClient.ts', () => ({
+      getPublicSupabaseClient: () => ({
+        auth: {
+          getSession: async () => ({
+            data: {
+              session: {
+                access_token: 'expiring-jwt.payload.sig',
+                expires_at: Math.floor(Date.now() / 1000) + 2,
+              },
+            },
+            error: null,
+          }),
+          refreshSession: refreshMock,
+        },
+      }),
+    }));
+    const apiModB = await import('../src/lib/api.ts');
+    const resolved = await apiModB.resolveActiveAuthToken();
+    expect(refreshMock).toHaveBeenCalledTimes(1);
+    expect(resolved).toBe('fresh-refreshed-jwt.payload.sig');
+    expect(apiModB.getStoredToken()).toBe('fresh-refreshed-jwt.payload.sig');
+
+    // Logout clears stored token
+    apiModB.setStoredToken(null);
+    expect(apiModB.getStoredToken()).toBeNull();
+    vi.doUnmock('../src/lib/supabaseClient.ts');
+  });
+});
+
+
 
 

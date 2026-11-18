@@ -18,6 +18,11 @@ export async function authenticateRequest(
   c: Context<{ Bindings: ServerBindings; Variables: AuthContextVariables }>,
   next: Next,
 ) {
+  if (c.get('currentUser')) {
+    await next();
+    return;
+  }
+
   const config = c.get('serverConfig');
   const repo = c.get('repo');
 
@@ -64,36 +69,83 @@ export async function authenticateRequest(
   }
 
   // 1. If Supabase is configured, verify JWT directly with Supabase Auth & load persistent profile
-  if (config.supabaseConfigured && config.supabaseUrl && (config.supabaseAnonKey || config.supabaseServiceRoleKey)) {
-    const apiKeyHeader = config.supabaseAnonKey || config.supabaseServiceRoleKey!;
+  if (config.supabaseConfigured && config.supabaseUrl && (config.supabaseServiceRoleKey || config.supabaseAnonKey)) {
+    // Reject malformed or non-ByteString tokens with 401 before invoking fetch()
+    const isAsciiSafe = /^[\x21-\x7E]+$/.test(token);
+    const looksLikeJwt = token.split('.').length === 3;
+    if (!isAsciiSafe || !looksLikeJwt) {
+      return c.json(
+        { error: { code: 'UNAUTHORIZED', message: 'Invalid or malformed Supabase session token.', requestId: c.get('requestId') } },
+        401,
+      );
+    }
+
+    const baseUrl = config.supabaseUrl.replace(/\/+$/, '');
+    const apiKeyHeader = (config.supabaseServiceRoleKey || config.supabaseAnonKey!).trim();
+    let supaUser: { id?: string; email?: string; user_metadata?: { full_name?: string } } | null = null;
+
     try {
-      const res = await fetch(`${config.supabaseUrl}/auth/v1/user`, {
+      const fetchInit: RequestInit = {
         headers: {
           Authorization: `Bearer ${token}`,
           apikey: apiKeyHeader,
         },
-      });
+      };
+      if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+        fetchInit.signal = AbortSignal.timeout(10_000);
+      }
+
+      const res = await fetch(`${baseUrl}/auth/v1/user`, fetchInit);
       if (!res.ok) {
+        if (res.status >= 500) {
+          return c.json(
+            {
+              error: {
+                code: 'AUTH_UPSTREAM_ERROR',
+                message: 'Supabase Auth service is temporarily unavailable.',
+                requestId: c.get('requestId'),
+              },
+            },
+            502,
+          );
+        }
         return c.json(
           { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired Supabase session.', requestId: c.get('requestId') } },
           401,
         );
       }
-      const supaUser = (await res.json()) as { id: string; email?: string; user_metadata?: { full_name?: string } };
-      const profile = await repo.upsertProfileFromSupabaseAuth({
-        id: supaUser.id,
-        email: supaUser.email || 'unknown@avarestai.com',
-        fullName: supaUser.user_metadata?.full_name || supaUser.email || 'Avarest User',
-      });
-      c.set('currentUser', profile);
-      await next();
-      return;
+      supaUser = (await res.json()) as { id?: string; email?: string; user_metadata?: { full_name?: string } };
     } catch {
       return c.json(
         { error: { code: 'AUTH_UPSTREAM_ERROR', message: 'Unable to verify session with Supabase Auth.', requestId: c.get('requestId') } },
         502,
       );
     }
+
+    if (!supaUser || typeof supaUser.id !== 'string' || !supaUser.id) {
+      return c.json(
+        { error: { code: 'UNAUTHORIZED', message: 'Invalid or expired Supabase session.', requestId: c.get('requestId') } },
+        401,
+      );
+    }
+
+    let profile: UserProfile;
+    try {
+      profile = await repo.upsertProfileFromSupabaseAuth({
+        id: supaUser.id,
+        email: supaUser.email || 'unknown@avarestai.com',
+        fullName: supaUser.user_metadata?.full_name || supaUser.email || 'Avarest User',
+      });
+    } catch {
+      return c.json(
+        { error: { code: 'PROFILE_SYNC_ERROR', message: 'Unable to load or provision workspace profile.', requestId: c.get('requestId') } },
+        503,
+      );
+    }
+
+    c.set('currentUser', profile);
+    await next();
+    return;
   }
 
   // 2. Local Staging Sandbox HMAC token verification (strictly disallowed in production)

@@ -17,6 +17,7 @@ import type {
   UserProfile,
   UserRole,
 } from '../shared/types.ts';
+import { getPublicSupabaseClient } from './supabaseClient.ts';
 
 const TOKEN_STORAGE_KEY = 'avarest_one_session_token';
 
@@ -51,8 +52,38 @@ export class ApiError extends Error {
   }
 }
 
+export async function resolveActiveAuthToken(): Promise<string | null> {
+  const supa = getPublicSupabaseClient();
+  if (!supa) {
+    return getStoredToken();
+  }
+
+  try {
+    const { data, error } = await supa.auth.getSession();
+    let session = !error ? data.session : null;
+    if (
+      session?.access_token &&
+      typeof session.expires_at === 'number' &&
+      session.expires_at * 1000 <= Date.now() + 10_000
+    ) {
+      const { data: refreshed, error: refreshError } = await supa.auth.refreshSession();
+      if (!refreshError && refreshed.session?.access_token) {
+        session = refreshed.session;
+      } else if (session.expires_at * 1000 <= Date.now()) {
+        session = null;
+      }
+    }
+
+    const token = session?.access_token || null;
+    setStoredToken(token);
+    return token;
+  } catch {
+    return getStoredToken();
+  }
+}
+
 async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const token = getStoredToken();
+  const token = await resolveActiveAuthToken();
   const headers = new Headers(init.headers);
   if (!headers.has('Content-Type') && init.body) {
     headers.set('Content-Type', 'application/json');
@@ -155,7 +186,7 @@ export const avarestApi = {
       onError?: (message: string) => void;
     },
   ): Promise<void> {
-    const token = getStoredToken();
+    const token = await resolveActiveAuthToken();
     const base = (import.meta.env.VITE_API_URL as string | undefined) || '';
     const res = await fetch(`${base}/api/v1/chat`, {
       method: 'POST',

@@ -1,5 +1,5 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { avarestApi, getStoredToken, setStoredToken } from '../lib/api.ts';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { ApiError, avarestApi, getStoredToken, resolveActiveAuthToken, setStoredToken } from '../lib/api.ts';
 import { getPublicSupabaseClient } from '../lib/supabaseClient.ts';
 import type { SystemHealthStatus, UserProfile } from '../shared/types.ts';
 
@@ -20,6 +20,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserProfile | null>(null);
   const [health, setHealth] = useState<SystemHealthStatus | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const explicitAuthInFlightRef = useRef(false);
 
   const refreshSession = useCallback(async () => {
     try {
@@ -30,25 +31,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     const supa = getPublicSupabaseClient();
-    if (supa) {
-      try {
-        const { data } = await supa.auth.getSession();
-        const accessToken = data.session?.access_token || null;
-        setStoredToken(accessToken);
-        if (!accessToken) {
-          setUser(null);
-          setLoading(false);
-          return;
-        }
-      } catch {
-        setStoredToken(null);
-        setUser(null);
-        setLoading(false);
-        return;
-      }
-    }
-
-    const token = getStoredToken();
+    const token = supa ? await resolveActiveAuthToken() : getStoredToken();
     if (!token) {
       setUser(null);
       setLoading(false);
@@ -58,7 +41,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       const res = await avarestApi.getSession();
       setUser(res.user);
-    } catch {
+    } catch (err) {
+      if (supa && err instanceof ApiError && err.status === 401) {
+        await supa.auth.signOut({ scope: 'local' }).catch(() => {});
+      }
       setStoredToken(null);
       setUser(null);
     } finally {
@@ -71,16 +57,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
     const supa = getPublicSupabaseClient();
     if (!supa) return;
-    const { data: listener } = supa.auth.onAuthStateChange((_event, session) => {
-      setStoredToken(session?.access_token || null);
-      if (session?.access_token) {
-        void avarestApi
-          .getSession()
-          .then((res) => setUser(res.user))
-          .catch(() => setUser(null));
-      } else {
-        setUser(null);
+    const { data: listener } = supa.auth.onAuthStateChange((event, session) => {
+      if (event === 'INITIAL_SESSION') {
+        return;
       }
+      if (event === 'SIGNED_OUT' || !session?.access_token) {
+        setStoredToken(null);
+        setUser(null);
+        return;
+      }
+
+      setStoredToken(session.access_token);
+      if (event === 'TOKEN_REFRESHED' || explicitAuthInFlightRef.current) {
+        return;
+      }
+
+      void avarestApi
+        .getSession()
+        .then((res) => setUser(res.user))
+        .catch((err) => {
+          if (err instanceof ApiError && err.status === 401) {
+            setStoredToken(null);
+            setUser(null);
+          }
+        });
     });
     return () => {
       listener.subscription.unsubscribe();
@@ -90,12 +90,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const signIn = async (email: string, password: string) => {
     const supa = getPublicSupabaseClient();
     if (supa) {
-      const { data, error } = await supa.auth.signInWithPassword({ email, password });
-      if (error) throw new Error(error.message);
-      setStoredToken(data.session?.access_token || null);
-      const res = await avarestApi.getSession();
-      setUser(res.user);
-      return;
+      explicitAuthInFlightRef.current = true;
+      try {
+        const { data, error } = await supa.auth.signInWithPassword({ email, password });
+        if (error) throw new Error(error.message);
+        const token = data.session?.access_token || null;
+        setStoredToken(token);
+        if (!token) {
+          throw new Error('Supabase Auth did not return an active session token.');
+        }
+        const res = await avarestApi.getSession();
+        setUser(res.user);
+        return;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          setStoredToken(null);
+          await supa.auth.signOut({ scope: 'local' }).catch(() => {});
+        }
+        throw err;
+      } finally {
+        explicitAuthInFlightRef.current = false;
+      }
     }
 
     const res = await avarestApi.login({ email, password });
@@ -106,19 +121,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const register = async (email: string, password: string, fullName: string) => {
     const supa = getPublicSupabaseClient();
     if (supa) {
-      const { data, error } = await supa.auth.signUp({
-        email,
-        password,
-        options: { data: { full_name: fullName } },
-      });
-      if (error) throw new Error(error.message);
-      if (!data.session) {
-        return { emailConfirmationRequired: true };
+      explicitAuthInFlightRef.current = true;
+      try {
+        const { data, error } = await supa.auth.signUp({
+          email,
+          password,
+          options: { data: { full_name: fullName } },
+        });
+        if (error) throw new Error(error.message);
+        if (!data.session) {
+          return { emailConfirmationRequired: true };
+        }
+        setStoredToken(data.session.access_token);
+        const res = await avarestApi.getSession();
+        setUser(res.user);
+        return { emailConfirmationRequired: false };
+      } finally {
+        explicitAuthInFlightRef.current = false;
       }
-      setStoredToken(data.session.access_token);
-      const res = await avarestApi.getSession();
-      setUser(res.user);
-      return { emailConfirmationRequired: false };
     }
 
     const res = await avarestApi.register({ email, password, fullName });
