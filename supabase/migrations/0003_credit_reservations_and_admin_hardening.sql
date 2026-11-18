@@ -1,5 +1,5 @@
 -- ============================================================================
--- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING (v3)
+-- AVAREST ONE — STAGING CREDIT RESERVATION & ADMIN AUTHORIZATION HARDENING (v4)
 -- Forward-only migration layered on top of 0001 and 0002.
 -- Target: Staging (wdbtszlcdliwacvztmjl). Never run directly on Production
 -- without staging verification and explicit release approval.
@@ -51,7 +51,31 @@ CREATE POLICY credit_reservations_owner_or_admin_select ON public.credit_reserva
 REVOKE INSERT, UPDATE, DELETE ON public.credit_reservations FROM anon, authenticated;
 
 -- ----------------------------------------------------------------------------
--- 2. INTERNAL HELPER: RECONCILE EXPIRED RESERVATIONS FOR A LOCKED USER ACCOUNT
+-- 2. DURABLE IDEMPOTENCY KEYS TABLE
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.idempotency_keys (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  operation_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  execution_state TEXT NOT NULL CHECK (execution_state IN ('pending', 'completed', 'failed')),
+  response_payload JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  CONSTRAINT uq_idempotency_user_op_key UNIQUE (user_id, operation_type, entity_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_idempotency_keys_expires
+  ON public.idempotency_keys (expires_at);
+
+ALTER TABLE public.idempotency_keys ENABLE ROW LEVEL SECURITY;
+
+REVOKE INSERT, UPDATE, DELETE ON public.idempotency_keys FROM anon, authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 3. INTERNAL HELPER: RECONCILE EXPIRED RESERVATIONS FOR A LOCKED USER ACCOUNT
 -- Caller MUST already hold FOR UPDATE lock on public.credit_accounts for p_user_id.
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public._reconcile_user_expired_reservations(
@@ -123,7 +147,7 @@ REVOKE ALL ON FUNCTION public._reconcile_user_expired_reservations(UUID, NUMERIC
   FROM PUBLIC, anon, authenticated;
 
 -- ----------------------------------------------------------------------------
--- 3. ATOMIC RESERVE CREDITS RPC (Service-Role Only, Expired Idempotency Handling)
+-- 4. ATOMIC RESERVE CREDITS RPC (Service-Role Only, Expired Idempotency Handling)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.reserve_credits(
   p_user_id UUID,
@@ -281,7 +305,7 @@ GRANT EXECUTE ON FUNCTION public.reserve_credits(UUID, NUMERIC, TEXT, TEXT, TEXT
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 4. ATOMIC FINALIZE RESERVATION RPC (Co-transactional Expiry Reconciliation)
+-- 5. ATOMIC FINALIZE RESERVATION RPC (Co-transactional Expiry Reconciliation)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.finalize_credit_reservation(
   p_user_id UUID,
@@ -363,7 +387,6 @@ BEGIN
     RETURN;
   END IF;
 
-  -- Fix: Co-transactional expired reservation finalization attempt reconciliation (no transaction rollback)
   IF v_res.status = 'reserved' AND v_res.expires_at <= NOW() THEN
     v_current := ROUND(v_current + v_res.reserved_amount, 4);
     UPDATE public.credit_accounts
@@ -485,7 +508,7 @@ GRANT EXECUTE ON FUNCTION public.finalize_credit_reservation(UUID, TEXT, NUMERIC
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 5. ATOMIC RELEASE RESERVATION RPC (On Provider Failure or Stream Cancellation)
+-- 6. ATOMIC RELEASE RESERVATION RPC (On Provider Failure or Stream Cancellation)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.release_credit_reservation(
   p_user_id UUID,
@@ -590,7 +613,7 @@ GRANT EXECUTE ON FUNCTION public.release_credit_reservation(UUID, TEXT, TEXT)
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 6. EXPIRED RESERVATION RECONCILIATION RPC (Deadlock-Free Account-First Locking)
+-- 7. EXPIRED RESERVATION RECONCILIATION RPC (Deadlock-Free Account-First Locking)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.reconcile_expired_credit_reservations(
   p_user_id UUID DEFAULT NULL,
@@ -666,7 +689,7 @@ GRANT EXECUTE ON FUNCTION public.reconcile_expired_credit_reservations(UUID, INT
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 7. ATOMIC FIRST-ADMIN BOOTSTRAP RPC (Transaction Advisory Lock)
+-- 8. ATOMIC FIRST-ADMIN BOOTSTRAP RPC (Transaction Advisory Lock)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.bootstrap_admin(
   p_email TEXT,
@@ -744,7 +767,100 @@ GRANT EXECUTE ON FUNCTION public.bootstrap_admin(TEXT, TEXT, NUMERIC)
   TO service_role;
 
 -- ----------------------------------------------------------------------------
--- 8. HARDEN COMPATIBILITY deduct_credits RPC (Strict service_role Only + Reconcile)
+-- 9. ATOMIC DECIDE AGENT APPROVAL RPC (Transactionally Locks Approval & Run)
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.decide_agent_approval(
+  p_user_id UUID,
+  p_approval_id UUID,
+  p_decision TEXT
+)
+RETURNS TABLE (
+  approval_id UUID,
+  run_id UUID,
+  decision TEXT,
+  run_status TEXT,
+  success BOOLEAN,
+  error_message TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_caller_role TEXT;
+  v_app RECORD;
+  v_run RECORD;
+BEGIN
+  v_caller_role := COALESCE(auth.role(), '');
+  IF v_caller_role <> 'service_role' AND CURRENT_USER NOT IN ('postgres', 'supabase_admin') THEN
+    RAISE EXCEPTION 'Forbidden: decide_agent_approval requires service_role authorization';
+  END IF;
+
+  IF p_decision NOT IN ('approved', 'rejected') THEN
+    RAISE EXCEPTION 'Invalid decision';
+  END IF;
+
+  SELECT * INTO v_app
+  FROM public.agent_approvals aa
+  WHERE aa.id = p_approval_id AND aa.user_id = p_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT p_approval_id, NULL::UUID, p_decision, NULL::TEXT, FALSE, 'Approval not found';
+    RETURN;
+  END IF;
+
+  IF v_app.decision <> 'pending' THEN
+    RETURN QUERY SELECT v_app.id, v_app.run_id, v_app.decision, NULL::TEXT, FALSE, 'Approval already decided';
+    RETURN;
+  END IF;
+
+  SELECT * INTO v_run
+  FROM public.agent_runs ar
+  WHERE ar.id = v_app.run_id AND ar.user_id = p_user_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN QUERY SELECT v_app.id, v_app.run_id, p_decision, NULL::TEXT, FALSE, 'Associated run not found';
+    RETURN;
+  END IF;
+
+  IF v_run.status <> 'awaiting_approval' THEN
+    RETURN QUERY SELECT v_app.id, v_app.run_id, v_app.decision, v_run.status, FALSE, 'Run is no longer awaiting approval (status: ' || v_run.status || ')';
+    RETURN;
+  END IF;
+
+  IF p_decision = 'rejected' THEN
+    UPDATE public.agent_approvals
+    SET decision = 'rejected', decided_at = NOW()
+    WHERE id = v_app.id;
+
+    UPDATE public.agent_runs
+    SET status = 'canceled', output_summary = 'Execution canceled at human approval checkpoint.', updated_at = NOW()
+    WHERE id = v_run.id;
+
+    RETURN QUERY SELECT v_app.id, v_app.run_id, 'rejected'::TEXT, 'canceled'::TEXT, TRUE, NULL::TEXT;
+    RETURN;
+  ELSE
+    UPDATE public.agent_approvals
+    SET decision = 'approved', decided_at = NOW()
+    WHERE id = v_app.id;
+
+    UPDATE public.agent_runs
+    SET status = 'running', updated_at = NOW()
+    WHERE id = v_run.id;
+
+    RETURN QUERY SELECT v_app.id, v_app.run_id, 'approved'::TEXT, 'running'::TEXT, TRUE, NULL::TEXT;
+    RETURN;
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.decide_agent_approval(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.decide_agent_approval(UUID, UUID, TEXT) TO service_role;
+
+-- ----------------------------------------------------------------------------
+-- 10. HARDEN COMPATIBILITY deduct_credits RPC (Strict service_role Only + Reconcile)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.deduct_credits(
   p_user_id UUID,
