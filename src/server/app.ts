@@ -142,6 +142,18 @@ export function createAvarestApiApp(options?: {
     if (err instanceof Error && err.message === 'INSUFFICIENT_CREDITS') {
       return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
     }
+    if (err instanceof Error && err.message === 'DATABASE_MIGRATION_REQUIRED') {
+      return c.json(
+        {
+          error: {
+            code: 'DATABASE_MIGRATION_REQUIRED',
+            message: 'Staging database migration 0003 has not been applied yet. Credit reservation functions are unavailable.',
+            requestId,
+          },
+        },
+        503,
+      );
+    }
     console.error(`[Avarest API Error] ${requestId}:`, err instanceof Error ? err.message : 'Unknown error');
     return c.json(
       { error: { code: 'INTERNAL_ERROR', message: 'An unexpected server error occurred.', requestId } },

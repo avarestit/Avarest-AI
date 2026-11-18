@@ -220,8 +220,17 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
 
   private mapRpcError(error: { message: string }): Error {
     const lower = error.message.toLowerCase();
+    if (
+      lower.includes('pgrst202') ||
+      lower.includes('function') ||
+      lower.includes('does not exist') ||
+      lower.includes('404') ||
+      (lower.includes('not found') && lower.includes('function'))
+    ) {
+      return new Error('DATABASE_MIGRATION_REQUIRED');
+    }
     if (lower.includes('insufficient')) return new Error('INSUFFICIENT_CREDITS');
-    if (lower.includes('not found')) return new Error('RESERVATION_NOT_FOUND');
+    if (lower.includes('reservation not found')) return new Error('RESERVATION_NOT_FOUND');
     if (lower.includes('forbidden')) return new Error('FORBIDDEN');
     if (lower.includes('no longer active')) return new Error('RESERVATION_NOT_ACTIVE');
     return new Error(error.message);
