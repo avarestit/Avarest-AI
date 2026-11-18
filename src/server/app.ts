@@ -1646,5 +1646,80 @@ export function createAvarestApiApp(options?: {
     return c.json({ policy });
   });
 
+  // =========================================================================
+  // NOT FOUND: JSON 404 FOR UNKNOWN API ROUTES; WORKER ASSETS + SPA FALLBACK
+  // =========================================================================
+  const STATIC_ASSET_EXT_RE =
+    /\.(?:js|mjs|css|map|png|jpg|jpeg|gif|webp|svg|ico|woff2?|ttf|eot|json|webmanifest|txt|xml)$/i;
+
+  app.notFound(async (c) => {
+    const path = c.req.path;
+    const requestId = c.get('requestId');
+
+    // Never return SPA HTML for unknown API routes
+    if (path === '/api' || path.startsWith('/api/')) {
+      return c.json(
+        {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'API endpoint not found.',
+            requestId,
+          },
+        },
+        404,
+      );
+    }
+
+    const mergedAssets = c.env?.ASSETS || options?.bindingsOverride?.ASSETS;
+    if (
+      mergedAssets &&
+      typeof mergedAssets.fetch === 'function' &&
+      (c.req.method === 'GET' || c.req.method === 'HEAD')
+    ) {
+      const assetResponse = await mergedAssets.fetch(c.req.raw);
+      if (assetResponse.status !== 404) {
+        return new Response(assetResponse.body, {
+          status: assetResponse.status,
+          statusText: assetResponse.statusText,
+          headers: new Headers(assetResponse.headers),
+        });
+      }
+
+      // Serve SPA index.html for client-side routes (skip missing static file extensions)
+      if (!STATIC_ASSET_EXT_RE.test(path)) {
+        const spaUrl = new URL('/index.html', c.req.url);
+        const spaResponse = await mergedAssets.fetch(
+          new Request(spaUrl.toString(), {
+            method: c.req.method,
+            headers: c.req.raw.headers,
+          }),
+        );
+        return new Response(spaResponse.body, {
+          status: spaResponse.ok ? 200 : spaResponse.status,
+          statusText: spaResponse.statusText,
+          headers: new Headers(spaResponse.headers),
+        });
+      }
+
+      return new Response(assetResponse.body, {
+        status: assetResponse.status,
+        statusText: assetResponse.statusText,
+        headers: new Headers(assetResponse.headers),
+      });
+    }
+
+    return c.json(
+      {
+        error: {
+          code: 'NOT_FOUND',
+          message: 'Route not found.',
+          requestId,
+        },
+      },
+      404,
+    );
+  });
+
   return app;
 }
+

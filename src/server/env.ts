@@ -5,6 +5,16 @@ export interface KVNamespaceLike {
   put(key: string, value: string, options?: { expirationTtl?: number }): Promise<void>;
 }
 
+export interface AssetsFetcherLike {
+  fetch(input: Request | URL | string, init?: RequestInit): Promise<Response>;
+}
+
+export function isValidKVNamespaceBinding(value: unknown): value is KVNamespaceLike {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<KVNamespaceLike>;
+  return typeof candidate.get === 'function' && typeof candidate.put === 'function';
+}
+
 export interface ServerBindings {
   AVAREST_ENVIRONMENT?: string;
   VITE_ENVIRONMENT?: string;
@@ -24,7 +34,8 @@ export interface ServerBindings {
   LLAMA_API_BASE_URL?: string;
   GITHUB_CLIENT_ID?: string;
   GOOGLE_CLIENT_ID?: string;
-  RATE_LIMIT_KV?: KVNamespaceLike;
+  RATE_LIMIT_KV?: KVNamespaceLike | string;
+  ASSETS?: AssetsFetcherLike;
 }
 
 export interface ConfigValidationSummary {
@@ -175,15 +186,23 @@ export function getServerConfig(bindings?: ServerBindings): ResolvedServerConfig
   const anthropicKey = readVar(bindings, 'ANTHROPIC_API_KEY');
   const deepseekKey = readVar(bindings, 'DEEPSEEK_API_KEY');
 
+  const hasValidRateLimitKv = isValidKVNamespaceBinding(bindings?.RATE_LIMIT_KV);
+  const hasInvalidRateLimitKvBinding = Boolean(bindings?.RATE_LIMIT_KV) && !hasValidRateLimitKv;
+
   const missingOptional: string[] = [];
   if (!openaiKey) missingOptional.push('OPENAI_API_KEY');
   if (!geminiKey) missingOptional.push('GEMINI_API_KEY');
   if (!anthropicKey) missingOptional.push('ANTHROPIC_API_KEY');
   if (!deepseekKey) missingOptional.push('DEEPSEEK_API_KEY');
   if (!adminBootstrapSecretStrong) missingOptional.push('ADMIN_BOOTSTRAP_SECRET (>= 16 chars)');
-  if (!bindings?.RATE_LIMIT_KV) missingOptional.push('RATE_LIMIT_KV');
+  if (!hasValidRateLimitKv) missingOptional.push('RATE_LIMIT_KV');
 
   const warnings: string[] = [];
+  if (hasInvalidRateLimitKvBinding) {
+    warnings.push(
+      'RATE_LIMIT_KV is configured as a plain value instead of a Cloudflare KV namespace binding; falling back to single_instance_memory.',
+    );
+  }
   if (configuredSessionSecret && !authSessionSecretStrong) {
     warnings.push('AUTH_SESSION_SECRET is shorter than 16 characters.');
   }
@@ -220,7 +239,7 @@ export function getServerConfig(bindings?: ServerBindings): ResolvedServerConfig
           : ''
         : configuredSessionSecret || getOrCreateEphemeralLocalSecret(),
     adminBootstrapSecret: configuredBootstrapSecret,
-    hasRateLimitKv: Boolean(bindings?.RATE_LIMIT_KV),
+    hasRateLimitKv: hasValidRateLimitKv,
     configValidation: {
       missingRequired,
       missingOptional,

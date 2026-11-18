@@ -1044,7 +1044,16 @@ describe('Cloudflare Workers Global Scope & Production Secret Guardrails', () =>
     expect(wranglerToml).toContain('SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"');
     expect(wranglerToml).toContain('VITE_SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"');
     expect(wranglerToml).toContain('APP_URL = "https://avarest-ai-staging.avarestglobal.workers.dev"');
-    expect(wranglerToml).toContain('avarest-ai-staging-rate-limit');
+    expect(wranglerToml).toContain('[env.staging.assets]');
+    expect(wranglerToml).toContain('directory = "./dist"');
+    expect(wranglerToml).toContain('binding = "ASSETS"');
+    expect(wranglerToml).toContain('not_found_handling = "single-page-application"');
+    expect(wranglerToml).toContain('run_worker_first = ["/api", "/api/*"]');
+    expect(wranglerToml).toContain('[[env.staging.kv_namespaces]]');
+    expect(wranglerToml).toContain('binding = "RATE_LIMIT_KV"');
+    expect(wranglerToml).toContain('id = "6d9baaa1ad3a485b958fce667a5ad16a"');
+    expect(wranglerToml).not.toContain('[[env.production.kv_namespaces]]');
+    expect(wranglerToml).not.toContain('[env.production.assets]');
     // Production block remains untouched
     expect(wranglerToml).toContain('[env.production]');
     expect(wranglerToml).toContain('SUPABASE_URL = "https://zdvhksmtxelxcudssdus.supabase.co"');
@@ -1061,6 +1070,149 @@ describe('Cloudflare Workers Global Scope & Production Secret Guardrails', () =>
     expect(envTs).toContain('GEMINI_API_KEY');
     expect(envTs).not.toContain('VITE_SUPABASE_STAGING_ANON_KEY');
   });
+
+  it('serves root and SPA routes via ASSETS, preserves /api/v1/health, and returns JSON 404 for unknown API routes', async () => {
+    const htmlContent = '<!doctype html><html><body><div id="root">Avarest One</div></body></html>';
+    const jsContent = 'console.log("avarest-bundle");';
+
+    const mockAssets = {
+      async fetch(input: Request | URL | string) {
+        const url = typeof input === 'string' ? new URL(input) : input instanceof URL ? input : new URL(input.url);
+        if (url.pathname === '/' || url.pathname === '/index.html') {
+          return new Response(htmlContent, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        }
+        if (url.pathname === '/assets/app.js') {
+          return new Response(jsContent, { status: 200, headers: { 'Content-Type': 'application/javascript' } });
+        }
+        return new Response('Not Found', { status: 404 });
+      },
+    };
+
+    const stagingEnv = {
+      AVAREST_ENVIRONMENT: 'staging',
+      VITE_ENVIRONMENT: 'staging',
+      SUPABASE_URL: SUPABASE_PROJECTS.staging.url,
+      VITE_SUPABASE_URL: SUPABASE_PROJECTS.staging.url,
+      ASSETS: mockAssets,
+    };
+
+    // 1. Root frontend response
+    const rootRes = await workerApp.fetch(new Request('https://avarest-ai-staging.avarestglobal.workers.dev/'), stagingEnv);
+    expect(rootRes.status).toBe(200);
+    expect(rootRes.headers.get('Content-Type')).toContain('text/html');
+    expect(await rootRes.text()).toContain('Avarest One');
+
+    // 2. Direct static asset response
+    const jsRes = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/assets/app.js'),
+      stagingEnv,
+    );
+    expect(jsRes.status).toBe(200);
+    expect(jsRes.headers.get('Content-Type')).toContain('application/javascript');
+
+    // 3. SPA route fallback (direct navigation / browser refresh on /chat or /projects/123)
+    const spaRes = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/chat'),
+      stagingEnv,
+    );
+    expect(spaRes.status).toBe(200);
+    expect(spaRes.headers.get('Content-Type')).toContain('text/html');
+    expect(await spaRes.text()).toContain('Avarest One');
+
+    // 4. Missing static asset with extension stays 404 (not HTML)
+    const missingAssetRes = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/assets/nonexistent.js'),
+      stagingEnv,
+    );
+    expect(missingAssetRes.status).toBe(404);
+
+    // 5. API health endpoint continues working
+    const healthRes = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api/v1/health'),
+      stagingEnv,
+    );
+    expect(healthRes.status).toBe(200);
+    const healthJson = (await healthRes.json()) as { status: string; environment: string };
+    expect(healthJson.status).toBe('ok');
+    expect(healthJson.environment).toBe('staging');
+
+    // 6. Unknown API routes return JSON 404, never frontend HTML
+    const unknownApiV1 = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api/v1/does-not-exist'),
+      stagingEnv,
+    );
+    expect(unknownApiV1.status).toBe(404);
+    expect(unknownApiV1.headers.get('Content-Type')).toContain('application/json');
+    const unknownApiV1Json = (await unknownApiV1.json()) as { error: { code: string } };
+    expect(unknownApiV1Json.error.code).toBe('NOT_FOUND');
+
+    const unknownApiRoot = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api'),
+      stagingEnv,
+    );
+    expect(unknownApiRoot.status).toBe(404);
+    expect(unknownApiRoot.headers.get('Content-Type')).toContain('application/json');
+  });
+
+  it('distinguishes a real KV namespace binding from a plain-text RATE_LIMIT_KV variable without crashing', async () => {
+    // Plain-text string must NOT be reported as distributed_kv or crash rate-limited routes
+    const plainTextEnv = {
+      AVAREST_ENVIRONMENT: 'staging',
+      RATE_LIMIT_KV: 'avarest-ai-staging-rate-limit',
+    };
+
+    const cfgPlain = getServerConfig(plainTextEnv);
+    expect(cfgPlain.hasRateLimitKv).toBe(false);
+    expect(cfgPlain.configValidation.missingOptional).toContain('RATE_LIMIT_KV');
+    expect(cfgPlain.configValidation.warnings.some((w) => w.includes('RATE_LIMIT_KV'))).toBe(true);
+
+    const healthPlain = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api/v1/health'),
+      plainTextEnv,
+    );
+    expect(healthPlain.status).toBe(200);
+    const healthPlainJson = (await healthPlain.json()) as {
+      rateLimitMode: string;
+      configValidation: { warnings: string[] };
+    };
+    expect(healthPlainJson.rateLimitMode).toBe('single_instance_memory');
+    expect(healthPlainJson.configValidation.warnings.some((w) => w.includes('RATE_LIMIT_KV'))).toBe(true);
+
+    // Rate-limited route still responds cleanly instead of throwing `this.kv.get is not a function`
+    const rateLimitedRoute = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api/v1/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'nobody@avarestai.com', password: 'wrong' }),
+      }),
+      plainTextEnv,
+    );
+    expect(rateLimitedRoute.status).toBe(401);
+
+    // Real KV namespace binding reports distributed_kv and sets hasRateLimitKv = true
+    const kvMap = new Map<string, string>();
+    const realKvEnv = {
+      AVAREST_ENVIRONMENT: 'staging',
+      RATE_LIMIT_KV: {
+        async get(key: string) {
+          return kvMap.get(key) ?? null;
+        },
+        async put(key: string, value: string) {
+          kvMap.set(key, value);
+        },
+      },
+    };
+    const cfgReal = getServerConfig(realKvEnv);
+    expect(cfgReal.hasRateLimitKv).toBe(true);
+
+    const healthReal = await workerApp.fetch(
+      new Request('https://avarest-ai-staging.avarestglobal.workers.dev/api/v1/health'),
+      realKvEnv,
+    );
+    const healthRealJson = (await healthReal.json()) as { rateLimitMode: string };
+    expect(healthRealJson.rateLimitMode).toBe('distributed_kv');
+  });
 });
+
 
 

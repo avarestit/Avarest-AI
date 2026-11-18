@@ -20,6 +20,13 @@ APP_URL = "https://staging.avarestai.com"
 
 [env.staging]
 name = "avarest-ai-staging"
+
+[env.staging.assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = ["/api", "/api/*"]
+
 [env.staging.vars]
 AVAREST_ENVIRONMENT = "staging"
 VITE_ENVIRONMENT = "staging"
@@ -27,12 +34,10 @@ SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
 VITE_SUPABASE_URL = "https://wdbtszlcdliwacvztmjl.supabase.co"
 APP_URL = "https://avarest-ai-staging.avarestglobal.workers.dev"
 
-# Existing Staging KV binding: bind namespace `avarest-ai-staging-rate-limit` as `RATE_LIMIT_KV`.
-# Retrieve the real namespace ID from Cloudflare (`npx wrangler kv namespace list` or Dashboard -> KV)
-# and uncomment below (never invent an ID):
-# [[env.staging.kv_namespaces]]
-# binding = "RATE_LIMIT_KV"
-# id = "<ACTUAL_ID_FOR_avarest-ai-staging-rate-limit>"
+# Staging distributed rate-limit KV namespace (`avarest-ai-staging-rate-limit`)
+[[env.staging.kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "6d9baaa1ad3a485b958fce667a5ad16a"
 
 [env.production]
 name = "avarest-one-api-production"

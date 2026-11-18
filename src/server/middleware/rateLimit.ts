@@ -1,5 +1,5 @@
 import type { Context, Next } from 'hono';
-import type { KVNamespaceLike, ResolvedServerConfig, ServerBindings } from '../env.ts';
+import { isValidKVNamespaceBinding, type KVNamespaceLike, type ResolvedServerConfig, type ServerBindings } from '../env.ts';
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -96,7 +96,7 @@ export class MemoryRateLimitAdapter implements RateLimitAdapter {
 const defaultMemoryRateLimiter = new MemoryRateLimitAdapter();
 
 export function resolveRateLimitAdapter(bindings?: ServerBindings): RateLimitAdapter {
-  if (bindings?.RATE_LIMIT_KV) {
+  if (isValidKVNamespaceBinding(bindings?.RATE_LIMIT_KV)) {
     return new KVRateLimitAdapter(bindings.RATE_LIMIT_KV);
   }
   return defaultMemoryRateLimiter;
