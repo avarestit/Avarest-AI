@@ -146,6 +146,12 @@ export interface WorkspaceRepository {
   getAgentRun(userId: string, runId: string): Promise<AgentRun | null>;
   createAgentRun(run: AgentRun): Promise<AgentRun>;
   updateAgentRun(runId: string, patch: Partial<AgentRun>): Promise<AgentRun | null>;
+  updateAgentRunConditional(
+    runId: string,
+    patch: Partial<AgentRun>,
+    expectedStatus?: AgentRun['status'],
+    userId?: string,
+  ): Promise<AgentRun | null>;
   createApproval(approval: AgentApproval): Promise<AgentApproval>;
   getApproval(userId: string, approvalId: string): Promise<AgentApproval | null>;
   resolveApproval(
@@ -574,6 +580,20 @@ export class MemoryWorkspaceRepository implements WorkspaceRepository {
     if (!run) return null;
     Object.assign(run, patch, { updatedAt: new Date().toISOString() });
     return run;
+  }
+
+  async updateAgentRunConditional(
+    runId: string,
+    patch: Partial<AgentRun>,
+    expectedStatus?: AgentRun['status'],
+    userId?: string,
+  ): Promise<AgentRun | null> {
+    const run = this.store.agentRuns.get(runId);
+    if (!run) return null;
+    if (userId && run.userId !== userId) return null;
+    if (expectedStatus && run.status !== expectedStatus) return null;
+    Object.assign(run, patch, { updatedAt: new Date().toISOString() });
+    return { ...run };
   }
 
   async createApproval(approval: AgentApproval): Promise<AgentApproval> {

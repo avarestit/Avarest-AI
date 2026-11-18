@@ -1750,10 +1750,16 @@ export function createAvarestApiApp(options?: {
       return c.json({ error: { code: 'INSUFFICIENT_CREDITS', message: 'Insufficient workspace credits.', requestId } }, 402);
     }
 
-    // Atomically claim pending -> approved so concurrent approvals cannot double-execute
+    // Atomically claim pending -> approved and run awaiting_approval -> running so concurrent cancellations/approvals cannot race
     const resolvedApproval = await repo.resolveApproval(approval.id, 'approved', user.id);
     if (!resolvedApproval) {
       return c.json({ error: { code: 'ALREADY_DECIDED', message: 'This approval was already resolved.' } }, 400);
+    }
+
+    const claimedRun = await repo.updateAgentRunConditional(run.id, { status: 'running' }, 'awaiting_approval', user.id);
+    if (!claimedRun) {
+      await repo.resolveApproval(approval.id, 'rejected', user.id).catch(() => {});
+      return c.json({ error: { code: 'RUN_CANCELED', message: 'The associated run was already canceled or is no longer awaiting approval.' } }, 409);
     }
 
     const referenceId = `agent-approval:${run.id}`;

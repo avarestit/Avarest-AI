@@ -930,6 +930,40 @@ export class SupabaseWorkspaceRepository implements WorkspaceRepository {
     };
   }
 
+  async updateAgentRunConditional(
+    runId: string,
+    patch: Partial<AgentRun>,
+    expectedStatus?: AgentRun['status'],
+    userId?: string,
+  ): Promise<AgentRun | null> {
+    const payload: Record<string, unknown> = { updated_at: new Date().toISOString() };
+    if (patch.status !== undefined) payload.status = patch.status;
+    if (patch.outputSummary !== undefined) payload.output_summary = patch.outputSummary;
+    if (patch.errorMessage !== undefined) payload.error_message = patch.errorMessage;
+
+    let query = this.db.from('agent_runs').update(payload).eq('id', runId);
+    if (expectedStatus) {
+      query = query.eq('status', expectedStatus);
+    }
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+    const { data } = await query.select('*').maybeSingle();
+    if (!data) return null;
+    return {
+      id: String(data.id),
+      agentId: String(data.agent_id),
+      agentName: 'Agent',
+      userId: String(data.user_id),
+      inputTask: String(data.input_task),
+      status: data.status as AgentRun['status'],
+      outputSummary: data.output_summary ? String(data.output_summary) : null,
+      errorMessage: data.error_message ? String(data.error_message) : null,
+      createdAt: String(data.created_at),
+      updatedAt: String(data.updated_at),
+    };
+  }
+
   async createApproval(approval: AgentApproval): Promise<AgentApproval> {
     const { error } = await this.db.from('agent_approvals').insert({
       id: approval.id,
